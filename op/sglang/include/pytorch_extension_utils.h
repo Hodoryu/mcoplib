@@ -1,7 +1,6 @@
 /*
  * 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
  *
- * Copyright (c) 2023 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,29 +20,29 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/library.h>
 
-#ifdef FLASHINFER_ENABLE_BF16
+#ifdef MCOPLIB_ENABLE_BF16
 #include <maca_bfloat16.h>
 #endif
 
-#ifdef FLASHINFER_ENABLE_F16
+#ifdef MCOPLIB_ENABLE_F16
 #include <maca_fp16.h>
 #endif
 
-#if defined(FLASHINFER_ENABLE_FP8_E4M3) || defined(FLASHINFER_ENABLE_FP8_E5M2)
+#if defined(MCOPLIB_ENABLE_FP8_E4M3) || defined(MCOPLIB_ENABLE_FP8_E5M2)
 #include <cuda_fp8.h>
 #endif
 
-#ifndef FLASHINFER_EXT_MODULE_INITED
-#define FLASHINFER_EXT_MODULE_INITED
+#ifndef MCOPLIB_EXT_MODULE_INITED
+#define MCOPLIB_EXT_MODULE_INITED
 
 // To expand macros in #name
-#define FLASHINFER_EXT_MODULE_INIT_EXPAND(name) FLASHINFER_EXT_MODULE_INIT(name)
+#define MCOPLIB_EXT_MODULE_INIT_EXPAND(name) MCOPLIB_EXT_MODULE_INIT(name)
 
 /* Creates a dummy empty module that can be imported from Python.
    The import from Python will load the .so consisting of the file
    in this extension, so that the TORCH_LIBRARY_FRAGMENT static initializers
    are run. */
-#define FLASHINFER_EXT_MODULE_INIT(name)                                  \
+#define MCOPLIB_EXT_MODULE_INIT(name)                                  \
   extern "C" {                                                            \
   __attribute__((weak)) PyObject* PyInit_##name(void) {                   \
     static struct PyModuleDef module_def = {                              \
@@ -62,14 +61,14 @@
   }                                                                       \
   }
 
-FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
+MCOPLIB_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
 
-#undef FLASHINFER_EXT_MODULE_INIT
-#undef FLASHINFER_EXT_MODULE_INIT_EXPAND
+#undef MCOPLIB_EXT_MODULE_INIT
+#undef MCOPLIB_EXT_MODULE_INIT_EXPAND
 
 #endif
 
-#ifdef FLASHINFER_ENABLE_F16
+#ifdef MCOPLIB_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
     using c_type = nv_half;             \
@@ -79,7 +78,7 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
 #define _DISPATCH_CASE_F16(c_type, ...)
 #endif
 
-#ifdef FLASHINFER_ENABLE_BF16
+#ifdef MCOPLIB_ENABLE_BF16
 #define _DISPATCH_CASE_BF16(c_type, ...) \
   case at::ScalarType::BFloat16: {       \
     using c_type = nv_bfloat16;          \
@@ -89,7 +88,7 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
 #define _DISPATCH_CASE_BF16(c_type, ...)
 #endif
 
-#ifdef FLASHINFER_ENABLE_FP8_E4M3
+#ifdef MCOPLIB_ENABLE_FP8_E4M3
 #define _DISPATCH_CASE_FP8_E4M3(c_type, ...) \
   case at::ScalarType::Float8_e4m3fn: {      \
     using c_type = __nv_fp8_e4m3;            \
@@ -99,7 +98,7 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
 #define _DISPATCH_CASE_FP8_E4M3(c_type, ...)
 #endif
 
-#ifdef FLASHINFER_ENABLE_FP8_E5M2
+#ifdef MCOPLIB_ENABLE_FP8_E5M2
 #define _DISPATCH_CASE_FP8_E5M2(c_type, ...) \
   case at::ScalarType::Float8_e5m2: {        \
     using c_type = __nv_fp8_e5m2;            \

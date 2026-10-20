@@ -5,6 +5,9 @@
 #include <maca_fp8.h>
 #include "../include/silu_mul_clamp_dsv4.h"
 namespace {
+    
+    typedef __NATIVE_VECTOR__(2, float) v2f;
+
 __device__ __forceinline__ float silu_mul_clamp_one(float g_raw, float u_raw,
                                                     float limit) {
   const float g = fminf(g_raw, limit);                 // gate: 只截上界（与原版一致）
@@ -26,27 +29,57 @@ __global__ __launch_bounds__(1024) void silu_mul_clamp_kernel(
     const int tid = threadIdx.x;
 
     const T* __restrict__ gate = input + row * 2 * int64_t(d);
+    const T* __restrict__ up = gate + d;
+
     T* __restrict__ out = output + row * int64_t(d);
 
     const int n_vec = d / kElemsPerVec;
     for (int v = tid; v < n_vec; v += blockDim.x) {
+        int offset = v * kElemsPerVec;
         // ---- 向量化加载: 每线程一次读 gate 16B + up 16B ----
-        const uint4 * ptr_gate_v = reinterpret_cast<const uint4*>(gate + int64_t(v) * kElemsPerVec * 2);
-        const uint4 g4 = *ptr_gate_v;
-        const uint4 u4 = *(ptr_gate_v + 1);
+        const uint4 g4 = *reinterpret_cast<const uint4*>(gate + offset);
+        const uint4 u4 = *reinterpret_cast<const uint4*>(up + offset);
             
         const T* gp = reinterpret_cast<const T*>(&g4);
         const T* upp = reinterpret_cast<const T*>(&u4);
         uint4 o4;
         T* op = reinterpret_cast<T*>(&o4);
-    #pragma unroll
-        for (int e = 0; e < kElemsPerVec; ++e) {
-        op[e] = static_cast<T>(silu_mul_clamp_one(static_cast<float>(gp[e]),
-                                                    static_cast<float>(upp[e]),
-                                                    limit));
+        float ga[kElemsPerVec];
+        float ega[kElemsPerVec];
+        float ua[kElemsPerVec];
+        #pragma unroll
+        for(int e = 0; e < kElemsPerVec; ++e) {
+            ga[e] =  fminf(static_cast<float>(gp[e]), limit);
         }
+        #pragma unroll
+        for(int e = 0; e < kElemsPerVec; ++e) {
+            ega[e] = __builtin_mxc_rcpf(1.0f + __builtin_expf(-ga[e]));
+        }
+        #pragma unroll
+        for(int e = 0; e < kElemsPerVec; ++e) {
+            ua[e] = fmaxf(fminf(static_cast<float>(upp[e]), limit), -limit);  // up: 双向截断
+        }
+        #pragma unroll
+        for(int e = 0; e < kElemsPerVec; e += 2) {
+            v2f v2dst = {0, 0};
+            *((v2f*)(ega + e)) = __builtin_mxc_pk_fma_f32(*(v2f*)(ga + e), *(v2f*)(ega + e), v2dst);
+        }
+        #pragma unroll
+        for(int e = 0; e < kElemsPerVec; e += 2) {
+             v2f v2dst = {0, 0};
+            *((v2f*)(ega + e)) = __builtin_mxc_pk_fma_f32(*(v2f*)(ua + e), *(v2f*)(ega + e), v2dst);
+            op[e] = static_cast<T>(ega[e]);
+            op[e + 1] = static_cast<T>(ega[e + 1]);
+        }
+
+    // #pragma unroll
+    //     for (int e = 0; e < kElemsPerVec; ++e) {
+    //     op[e] = static_cast<T>(silu_mul_clamp_one(static_cast<float>(gp[e]),
+    //                                                 static_cast<float>(upp[e]),
+    //                                                 limit));
+    //     }
         // ---- 向量化存储: 一次写 16B ----
-        *reinterpret_cast<uint4*>(out + int64_t(v) * kElemsPerVec) = o4;
+        *reinterpret_cast<uint4*>(out + offset) = o4;
     } 
 }
 
@@ -74,7 +107,7 @@ void silu_and_mul_clamp(const torch::Tensor& input,
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  constexpr int kThreads = 512;
+  constexpr int kThreads = 256;
   const dim3 grid(static_cast<unsigned int>(rows));
   const dim3 block(kThreads);
 

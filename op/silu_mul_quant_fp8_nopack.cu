@@ -4,6 +4,8 @@
 #include "../kernel/dispatch_utils.h"
 #include <maca_fp8.h>
 #include "../include/fp8_quant_kernel.h"
+#include "mcoplib_ops_params_info.hpp"
+#include "mcoplib_ops_params_dump.hpp"
 
 typedef __NATIVE_VECTOR__(4, _Float16) v4f16;
 
@@ -309,6 +311,9 @@ void fused_silu_mul_dq_mask_quant_fp8_nopack(
     std::optional<int> isTranspose
 )
 {
+    DEBUG_TRACE_PARAMS(output, output_scale, input, mask, quant_group, swiglu_limit, isTranspose);
+    DEBUG_DUMP_PARAMS(output, output_scale, input, mask, quant_group, swiglu_limit, isTranspose);
+
     TORCH_CHECK(input.dim() == 3 , "only support 3 dims");
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(output.is_contiguous());

@@ -4,6 +4,5 @@ pyyaml
 pydantic >= 2.10
 python_version > '3.9'
 pybind11 >= 2.13.1
-torch >= 2.4.0
-flashinfer >=0.2.6
+torch >= 2.10.0
 triton >= 2.0.0

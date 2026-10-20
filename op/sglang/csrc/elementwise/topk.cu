@@ -1,5 +1,6 @@
 #include <ATen/core/TensorBase.h>
 #include <ATen/core/TensorBody.h>
+#include <ATen/Functions.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
@@ -9,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+
 
 namespace {
 
@@ -103,7 +105,7 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
 }
 
 
-__device__ void fast_topk_cuda_tl_exact(
+__device__ __forceinline__ void fast_topk_cuda_tl_exact(
     const float* __restrict__ input, int32_t* __restrict__ index, int row_start, int length) {
   int topk = TopK;
   constexpr auto BLOCK_SIZE = kThreadsPerBlock;
@@ -338,6 +340,152 @@ __device__ void fast_topk_cuda_tl_exact(
     __syncthreads();
   }
 
+  // FIX-C: 修复阈值候选数量超过共享内存缓存上限，出现精度问题
+  //设置兜底路径，当阈值候选数量超过共享内存缓存上限的时候会进入该路径
+  if (C10_UNLIKELY(s_num_input[0] > int(SMEM_INPUT_SIZE))) {
+    const auto coarse_threshold_bin = threshold_bin;
+    uint32_t refine_prefix = 0;
+    uint32_t refine_mask = 0;
+    bool use_shared_cache = false;
+    int cached_buffer = 0;
+    int cached_count = 0;
+
+#pragma unroll 4
+    for (int round = 0; round < 4; ++round) {
+      const auto offset = 24 - round * 8;
+
+      run_refine_cumsum();
+
+      if (s_histogram[0] == topk) {
+        if (use_shared_cache) {
+          for (int i = tx; i < cached_count; i += BLOCK_SIZE) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            if (pos >= 0 && pos < TopK) index[pos] = s_input_idx[cached_buffer][i];
+          }
+        } else {
+          for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+            const auto raw_input = row_input[idx];
+            if (convert_to_uint10(raw_input) != coarse_threshold_bin) continue;
+            const auto key = convert_to_uint32(raw_input);
+            if ((key & refine_mask) != refine_prefix) continue;
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            if (pos >= 0 && pos < TopK) index[pos] = idx;
+          }
+        }
+        __syncthreads();
+        return;
+      }
+
+      if (tx < 256 && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+        s_threshold_bin_id = tx;
+      }
+      __syncthreads();
+
+      const auto refine_threshold_bin = s_threshold_bin_id;
+      topk -= s_histogram[refine_threshold_bin + 1];
+      __syncthreads();
+
+      const auto next_buffer = use_shared_cache ? (cached_buffer ^ 1) : 0;
+      if (tx == 0) s_num_input[next_buffer] = 0;
+      for (int i = tx; i < 257; i += BLOCK_SIZE) {
+        s_histogram[i] = 0;
+      }
+      __syncthreads();
+
+      if (use_shared_cache) {
+        for (int i = tx; i < cached_count; i += BLOCK_SIZE) {
+          const auto idx = s_input_idx[cached_buffer][i];
+          const auto raw_input = s_input_value[cached_buffer][i];
+          const auto key = convert_to_uint32(raw_input);
+          const auto bin = (key >> offset) & 0xFF;
+          if (bin > refine_threshold_bin) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            if (pos >= 0 && pos < TopK) index[pos] = idx;
+          } else if (bin == refine_threshold_bin && topk != 0) {
+            if (round == 3) {
+              const auto ticket = ::atomicAdd(&s_num_input[next_buffer], 1);
+              if (ticket < topk) {
+                const auto pos = ::atomicAdd(&s_counter, 1);
+                if (pos >= 0 && pos < TopK) index[pos] = idx;
+              }
+            } else {
+              const auto pos = ::atomicAdd(&s_num_input[next_buffer], 1);
+              if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+                s_input_idx[next_buffer][pos] = idx;
+                s_input_value[next_buffer][pos] = raw_input;
+                const auto next_bin = (key >> (offset - 8)) & 0xFF;
+                assert(next_bin < 256 && "use_shared_cache next_bin out of range!");
+                assert(isfinite(raw_input) && "use_shared_cache  raw_input is NaN or Inf!");
+                if (C10_LIKELY(next_bin < 256)) {
+                  ::atomicAdd(&s_histogram[next_bin], 1);
+                }
+              }
+            }
+          }
+        }
+      } else {
+        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+          const auto raw_input = row_input[idx];
+          if (convert_to_uint10(raw_input) != coarse_threshold_bin) continue;
+
+          const auto key = convert_to_uint32(raw_input);
+          if ((key & refine_mask) != refine_prefix) continue;
+
+          const auto bin = (key >> offset) & 0xFF;
+          if (bin > refine_threshold_bin) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            if (pos >= 0 && pos < TopK) index[pos] = idx;
+          } else if (bin == refine_threshold_bin && topk != 0) {
+            if (round == 3) {
+              const auto ticket = ::atomicAdd(&s_num_input[next_buffer], 1);
+              if (ticket < topk) {
+                const auto pos = ::atomicAdd(&s_counter, 1);
+                if (pos >= 0 && pos < TopK) index[pos] = idx;
+              }
+            } else {
+              const auto pos = ::atomicAdd(&s_num_input[next_buffer], 1);
+              const auto next_bin = (key >> (offset - 8)) & 0xFF;
+              assert(next_bin < 256 && " next_bin out of range!");
+              assert(isfinite(raw_input) && "raw_input is NaN or Inf!");
+              if (C10_LIKELY(next_bin < 256)) {
+                ::atomicAdd(&s_histogram[next_bin], 1);
+              }
+              if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+                s_input_idx[next_buffer][pos] = idx;
+                s_input_value[next_buffer][pos] = raw_input;
+              }
+            }
+          }
+        }
+      }
+      __syncthreads();
+
+      if (topk == 0 || round == 3) return;
+
+      if (use_shared_cache) {
+        cached_buffer = next_buffer;
+        // FIX: cached_count must be clamped to SMEM_INPUT_SIZE to prevent
+        // out-of-bounds access in loops at lines 361 and 395. When threshold-bin
+        const auto raw_count = s_num_input[next_buffer];
+        cached_count = (raw_count < int(SMEM_INPUT_SIZE)) ? raw_count : int(SMEM_INPUT_SIZE);
+      } else {
+        const auto next_count = s_num_input[next_buffer];
+        if (next_count <= int(SMEM_INPUT_SIZE)) {
+          use_shared_cache = true;
+          cached_buffer = next_buffer;
+          // FIX: next_count <= SMEM_INPUT_SIZE is checked above, but clamp
+          cached_count = next_count;
+        } else {
+          const auto byte_mask = uint32_t{0xFF} << offset;
+          refine_mask |= byte_mask;
+          refine_prefix =
+              (refine_prefix & ~byte_mask) | (uint32_t(refine_threshold_bin) << offset);
+        }
+      }
+    }
+    return;
+  }
+
   // stage 2: refine with 8bit radix passes (4 rounds = exact 32-bit resolution)
 #pragma unroll 4
   for (int round = 0; round < 4; ++round) {
@@ -384,7 +532,7 @@ __device__ void fast_topk_cuda_tl_exact(
         const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+          if (pos >= 0 && pos < TopK) index[pos] = idx;
         } else if (bin == threshold_bin) {
           if (round == 3) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
@@ -627,6 +775,23 @@ void fast_topk_transform_decode_launch(
     int64_t src_stride,
     uint32_t B,
     cudaStream_t stream);
+    
+// Split-K (multi-CTA cooperative radix) for small B with long rows. Workspace
+// is at::zeros-allocated per launch on the current stream (stream-ordered, so
+// concurrent launches on other streams get independent buffers).
+size_t fast_topk_splitk_workspace_bytes(uint32_t B);
+void fast_topk_transform_decode_splitk_launch(
+    const float* input,
+    const int32_t* lengths,
+    int64_t input_stride,
+    int32_t* dst_page_table,
+    const int32_t* src_page_table,
+    int64_t src_stride,
+    uint32_t B,
+    void* workspace,
+    size_t workspace_bytes,
+    size_t max_length_val,
+    cudaStream_t stream);
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 
@@ -688,10 +853,27 @@ void fast_topk_transform_interface(
   // target verify: row_starts_opt is null, invokes the prefill kernel
   const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
   if (is_decode) {
-    // isolated decode TU owns this path (see topk_decode.cu)
-    fast_topk_transform_decode_launch(
-        params.input, params.lengths, params.input_stride, dst_page_table.data_ptr<int32_t>(),
-        src_page_table.data_ptr<int32_t>(), src_stride, static_cast<uint32_t>(B), stream);
+      static const int kSMs = [] {
+      int dev = 0, sms = 32;
+      if (::cudaGetDevice(&dev) == cudaSuccess)
+        ::cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+      return sms > 0 ? sms : 32;
+    }();
+    const auto max_len = std::max<int64_t>(score.size(1), score.stride(0));
+    if (static_cast<uint64_t>(B) * 4 <= static_cast<uint64_t>(kSMs) && max_len > TopK) {
+      const auto ws = at::zeros(
+          {static_cast<int64_t>(fast_topk_splitk_workspace_bytes(static_cast<uint32_t>(B)))},
+          score.options().dtype(at::kByte));
+      fast_topk_transform_decode_splitk_launch(
+          params.input, params.lengths, params.input_stride, dst_page_table.data_ptr<int32_t>(),
+          src_page_table.data_ptr<int32_t>(), src_stride, static_cast<uint32_t>(B),
+          ws.data_ptr(), static_cast<size_t>(ws.size(0)), score.size(1), stream);
+    } else {
+      fast_topk_transform_decode_launch(
+          params.input, params.lengths, params.input_stride, dst_page_table.data_ptr<int32_t>(),
+          src_page_table.data_ptr<int32_t>(), src_stride, static_cast<uint32_t>(B), stream);
+    }
+
   } else {
     // Device-adaptive: GPUs with > 96KB optin smem run the 24KB HIGH scheme; GPUs
     // with <= 64KB smem run the 16KB LOW scheme. Both templates are instantiated.

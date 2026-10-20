@@ -948,6 +948,7 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
     }
   }
 
+
   const int num_dims = input.dim();
   const int64_t input_stride_d2 = input.stride(-2);
   const int64_t input_stride_d3 = num_dims >= 3 ? input.stride(-3) : 0;
@@ -1111,8 +1112,8 @@ void rms_norm(torch::Tensor &out, torch::Tensor &input,
             }
 
             if (!launched && can_use_cached) {
-              if (is_c600) {
-                int mr_block = vec_count <= 512 ? 128 : (vec_count <= 1024 ? 256 : 512);
+              int mr_block = vec_count <= 512 ? 128 : (vec_count <= 1024 ? 256 : 512);
+              if (is_c600 && vec_count % mr_block == 0) {
                 int mr_items = vec_count / mr_block;
                 dim3 mr_grid = dim3(std::max(1, std::min(num_tokens, prop.multiProcessorCount * (3072 / mr_block))));
   

@@ -1,4 +1,5 @@
 
+#include <torch/csrc/stable/tensor.h>
 #include "quantization/w8a8/per_token_group_quant_8bit.h"
 
 void per_token_group_quant_int8(const torch::stable::Tensor& input,

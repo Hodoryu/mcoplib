@@ -1,11 +1,18 @@
 import torch
 from mcoplib.op import silu_and_mul_clamp
 from mcoplib.profiler import profiler
+import mcoplib.sgl_kernel as sgl
 
-def silu(x: torch.Tensor) -> torch.Tensor:
-    return x / (1.0 + torch.exp(-x))
+#torch.ops.sgl_kernel.silu_and_mul_clamp_check is ref jit kernel  silu_and_mul_clamp is my opt kernel
+@profiler(output_dir="./profiles", warmup=2, repeat=3)
+def ref(input_tensor, out, swiglu_limit):
+    torch.ops.sgl_kernel.silu_and_mul_clamp_check(input_tensor, out, swiglu_limit)
 
-# @profiler(output_dir="./profiles", warmup=2, repeat=3)
+@profiler(output_dir="./profiles", warmup=2, repeat=3)
+def opt(input_tensor, out, swiglu_limit):
+    silu_and_mul_clamp(input_tensor, out, swiglu_limit)
+
+
 def silu_mul_clamp_test(
     M: int,
     hidden_size_list: list[int],
@@ -32,7 +39,7 @@ def silu_mul_clamp_test(
 
     result_dict = {}
     for hidden_size in hidden_size_list:
-        print(f"\n===== hidden_size = {hidden_size} =====")
+        print(f"\n===== hidden_size = {hidden_size} ===== tokens ===={M}=========")
         assert hidden_size % vec_elem == 0, f"hidden_size={hidden_size} must be multiple of {vec_elem}"
         num_vec_pairs_per_row = hidden_size // vec_elem
         D = 2 * hidden_size
@@ -42,24 +49,9 @@ def silu_mul_clamp_test(
         out = torch.empty((M, hidden_size), dtype=dtype, device=dev)
         out_check = torch.empty((M, hidden_size), dtype=dtype, device=dev)
 
-        x = input_tensor.reshape(M, num_vec_pairs_per_row, 2, vec_elem)
-        gate = x[:, :, 0, :]   # [M, num_pairs, vec_elem]
-        up   = x[:, :, 1, :]   # [M, num_pairs, vec_elem]
+        ref(input_tensor, out, swiglu_limit)
+        opt(input_tensor, out_check, swiglu_limit)
 
-        g = gate.float()
-        u = up.float()
-        if swiglu_limit is not None:
-            g = torch.clamp(g, max=swiglu_limit)
-            u = torch.clamp(u, min=-swiglu_limit, max=swiglu_limit)
-
-        s_g = silu(g)
-        res = s_g * u
-        res = res.to(dtype)
-
-        # [M, num_pairs, vec_elem] -> [M, hidden_size]
-        out = res.flatten(1, 2)
-
-        silu_and_mul_clamp(input_tensor, out_check, swiglu_limit)
         all_close = torch.allclose(out, out_check, atol=1e-2, rtol=1e-2)
         mask = ~torch.isclose(out, out_check, atol=1e-3, rtol=1e-3)
         print("是否存在差异：", mask.any().item())

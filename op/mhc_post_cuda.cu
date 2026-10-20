@@ -17,6 +17,14 @@ static std::pair<int, int> select_mhc_post_config(
     vector_width = 4;
     threads = 128;
   }
+  if (ap_count == 104 && hc == 4 && h == 5120 && n > 8 &&
+      alignment_bits % 4 == 0) {
+    // C500 production shapes. Small-token candidates were within measurement
+    // noise, so N<=8 keeps the portable V4/T128 policy. All larger shapes use
+    // the same two-wide, 256-thread configuration for a uniform dispatch rule.
+    vector_width = 2;
+    threads = 256;
+  }
   if ((ap_count == 28 || ap_count == 32) && hc == 4 &&
       (h == 4096 || h == 7168) && alignment_bits % 16 == 0) {
     // Preserve the measured small-token and large-token policies on MetaX.
@@ -40,7 +48,7 @@ static std::pair<int, int> select_mhc_post_config(
 // checked on the host; the last block masks complete packs, never partial ones.
 template<int V> struct alignas(V * 2) Bf16Pack { at::BFloat16 value[V]; };
 
-// The suffix "4" means HC=4, not the vector width (V can be 4 or 8).
+// The suffix "4" means HC=4, not the vector width (V can be 2, 4, or 8).
 template<int V, int THREADS>
 __global__ void mhc_post_vector4(const float* __restrict__ a,
     const at::BFloat16* __restrict__ b, const float* __restrict__ c,
@@ -139,8 +147,10 @@ torch::Tensor mhc_post_dispatch(torch::Tensor x, torch::Tensor residual,
   for (const auto& t : {x, residual, post, comb})
     TORCH_CHECK(!out.is_alias_of(t), "out must not alias an input");
   c10::cuda::CUDAGuard guard(residual.device());
-  // -1: production policy; 1: preserved scalar baseline; 4/8: tuning API.
-  TORCH_CHECK(vector_width == -1 || vector_width == 1 || vector_width == 4 || vector_width == 8, "invalid vector width");
+  /// -1: production policy; 1: preserved scalar baseline; 2/4/8: tuning API.
+  TORCH_CHECK(vector_width == -1 || vector_width == 1 || vector_width == 2 ||
+                  vector_width == 4 || vector_width == 8,
+              "invalid vector width");
   TORCH_CHECK(threads == 64 || threads == 128 || threads == 256, "invalid thread count");
   if (n == 0) return out;
   const auto a = comb.data_ptr<float>();
@@ -168,7 +178,9 @@ torch::Tensor mhc_post_dispatch(torch::Tensor x, torch::Tensor residual,
     auto stream = at::cuda::getCurrentCUDAStream();
     #define VECTOR(V,T) mhc_post_vector4<V,T><<<grid,T,0,stream>>>(a,b,c,d,y,h)
     #define BY_THREADS(V) if (threads == 64) { VECTOR(V,64); } else if (threads == 128) { VECTOR(V,128); } else { VECTOR(V,256); }
-    if (vector_width == 4) { BY_THREADS(4); } else { BY_THREADS(8); }
+    if (vector_width == 2) { BY_THREADS(2); }
+    else if (vector_width == 4) { BY_THREADS(4); }
+    else { BY_THREADS(8); }
     #undef BY_THREADS
     #undef VECTOR
     C10_CUDA_KERNEL_LAUNCH_CHECK();

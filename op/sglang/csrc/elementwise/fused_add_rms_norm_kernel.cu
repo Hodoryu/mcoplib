@@ -14,12 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #include <ATen/cuda/CUDAContext.h>
-
-#include <flashinfer/norm.cuh>
-
 #include "utils.h"
-
-using namespace flashinfer;
+#include "norm.cuh"
 
 template<typename T>
 static __device__ __forceinline__ T float_to_dstT(float value) {
@@ -272,7 +268,7 @@ void sgl_fused_add_rmsnorm(
   if(status == 0) return;
   // support float16, bfloat16 and float32
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
-    cudaError_t status = norm::FusedAddRMSNorm(
+    cudaError_t status = mcoplib::norm::FusedAddRMSNorm(
         static_cast<c_type*>(input.data_ptr()),
         static_cast<c_type*>(residual.data_ptr()),
         static_cast<c_type*>(weight.data_ptr()),

@@ -9,7 +9,9 @@
 // predicate that mirrors the production Triton dispatch.
 //
 // Instantiated for Pool=true, Gqa x Exp2 x Ragged x StateBf16,
-// Streaming=false, Bv=64.
+// Streaming=false, Bv=64 by default; the hot C500 ragged T8192/N1/H8
+// FP32-state contract also instantiates the experimental 128-thread Bv=16
+// mapping.
 // The Pool=true form is used for every call: with identity slot indices and the
 // tensor's own stride(0) it reproduces the dense addressing exactly, and it also
 // covers the pooled/sentinel contract and any padded slot pitch.
@@ -36,6 +38,15 @@
 #include "../include/chunk_gated_delta_rule_fwd_h.h"
 
 namespace {
+
+// Both xcore1000 and xcore1008 belong to the C500 device branch. Other
+// device images keep the original full W panel at compile time.
+#if defined(__MACA_ARCH__) && \
+    ((__MACA_ARCH__ == 1000) || (__MACA_ARCH__ == 1008))
+constexpr bool kC500DeviceImage = true;
+#else
+constexpr bool kC500DeviceImage = false;
+#endif
 
 // ---- constants and type alias (probe) ----
 using bf16 = __nv_bfloat16;
@@ -67,9 +78,10 @@ constexpr size_t kChunkPlanCacheCapacity = 4;
 // gives a 34-word row step and therefore distinct banks across a 16-lane
 // group; kBV + 8 = 72 (= 36 words, a multiple of 4) only reached eight.
 constexpr int kResStride = kBV + 4;
-// Padded row stride for the BF16 snapshot and for the K tile that reuses the
-// same buffer. The padding is chosen for shared-memory banks, not for
-// alignment: with a half-word step S the lane groups are separated by
+// Padded row stride for the BF16 snapshot and for the default K-tile reader.
+// The BV16 Hgemm/PERM path reuses the buffer with a dense 128-half K stride.
+// The padding is chosen for shared-memory banks, not for alignment: with a
+// half-word step S the lane groups are separated by
 // 4*S halves = 2*S words, and the eight-byte operands advance by S/2 words per
 // lane. S = 132 gives 2*S = 264 = 8 (mod 32), so the four lane groups tile all
 // 32 banks instead of collapsing onto two, and S/2 = 66 = 2 (mod 4) makes
@@ -230,6 +242,17 @@ __device__ __forceinline__ void store_output(bf16* ptr, bf16 value) {
 // ---- fragment types ----
 using NativeB64 = __NATIVE_VECTOR__(2, uint32_t);
 using NativeF32x4 = __NATIVE_VECTOR__(4, float);
+
+// The Hgemm B-operand loader transposes a 4x4 block of packed 16-bit values
+// in registers. The operation is bitwise, so the FP16 selectors apply to BF16
+// unchanged.
+constexpr uint32_t kPermSel0 = 0x01000504;
+constexpr uint32_t kPermSel1 = 0x03020706;
+
+__device__ __forceinline__ uint32_t perm_b32(uint32_t lo, uint32_t hi,
+                                             uint32_t selector) {
+  return __builtin_mxc_byte_perm(lo, hi, selector);
+}
 
 template <bool Streaming>
 __device__ __forceinline__ void store_output_vec(bf16* ptr, uint4 value) {
@@ -458,7 +481,7 @@ __device__ __forceinline__ void store_state_vec(float* st, int off,
 }
 
 template <bool FullChunk, bool Streaming, bool Exp2, bool UseG,
-          bool SaveNewValue, int Bv>
+          bool SaveNewValue, int Bv, int Threads, bool HalfWPanel>
 __device__ __forceinline__ void process_chunk_native(
     const bf16* __restrict__ k, const bf16* __restrict__ w,
     const bf16* __restrict__ u, const float* __restrict__ g,
@@ -467,8 +490,9 @@ __device__ __forceinline__ void process_chunk_native(
     int k_heads_eff, int k_head, int token0, int chunk, int v_base,
     int row_max, uint32_t tok_kk, int wave_m, int wave_n, int lane,
     bf16* state_bf16, bf16* residual_panel, bf16* w_panel,
-    float* decay_panel, NativeF32x4 (&state_reg)[2][2][Bv / 32]) {
-  constexpr int kNV = Bv / 32;
+    float* decay_panel,
+    NativeF32x4 (&state_reg)[2][2][(Bv == 16 ? 1 : Bv / 32)]) {
+  constexpr int kNV = Bv == 16 ? 1 : Bv / 32;
   constexpr int kFullLastLocal = kBT - 1;
       // 64-bit addressing is confined to these six per-chunk base pointers.
       // Everything inside the unrolled loops below uses 32-bit element offsets:
@@ -501,32 +525,52 @@ __device__ __forceinline__ void process_chunk_native(
                (static_cast<size_t>(token0) * heads + head) * kK;
       }
 
-    // Round the register state to BF16 once; the same 4-half word feeds the
-    // projection B operand and the h output.  Each thread owns (p, mi, ni),
-    // i.e. eight 8-byte words, and no per-element division is needed.
+    // Round the register state to BF16 once; the same snapshot feeds the
+    // projection B operand and h. BV16 keeps the recurrent state in Hgemm
+    // C-fragment order: q=(2*p+mi), component i owns
+    //   kk = wave*64 + lane_group*16 + i*4 + q.
+    // Transpose that local 4x4 tile while packing so shared memory remains in
+    // the original contiguous [v][kk] layout.
+    if constexpr (Bv == 16 && Threads == 128) {
+      const int v_local = lane & 15;
+      const int kk_base = wave_m * 64 + (lane >> 4) * 16;
 #pragma unroll
-    for (int p = 0; p < 2; ++p)
+      for (int i = 0; i < 4; ++i) {
+        alignas(8) bf16 pack[4];
 #pragma unroll
-      for (int mi = 0; mi < 2; ++mi)
+        for (int q = 0; q < 4; ++q)
+          pack[q] = __float2bfloat16(state_reg[q >> 1][q & 1][0][i]);
+        *reinterpret_cast<NativeB64*>(
+            state_bf16 + v_local * kKStride + kk_base + i * 4) =
+            *reinterpret_cast<const NativeB64*>(pack);
+      }
+    } else {
 #pragma unroll
-        for (int ni = 0; ni < kNV; ++ni) {
-          const int v_local = wave_n * (Bv / 2) + ni * 16 + (lane & 15);
-          const int kk0 = p * 64 + wave_m * 32 + mi * 16 + (lane >> 4) * 4;
-          alignas(8) bf16 pack[4];
+      for (int p = 0; p < 2; ++p)
 #pragma unroll
-          for (int r = 0; r < 4; ++r)
-            pack[r] = __float2bfloat16(state_reg[p][mi][ni][r]);
-          const uint2 word = *reinterpret_cast<const uint2*>(pack);
-          *reinterpret_cast<uint2*>(state_bf16 + v_local * kKStride + kk0) =
-              word;
-        }
-    // W tile for the projection A operand: all 64 rows and all 128 k at once.
-    // Issued before the snapshot barrier so its global loads are in flight while
-    // the snapshot stores retire; the barrier is what makes the panel visible to
-    // the projection below.
+        for (int mi = 0; mi < 2; ++mi)
 #pragma unroll
-    for (int copy = 0; copy < kBT * kK / (kThreads * 8); ++copy) {
-      const int vec = threadIdx.x + copy * kThreads;
+          for (int ni = 0; ni < kNV; ++ni) {
+            const int v_local =
+                wave_n * (Bv / 2) + ni * 16 + (lane & 15);
+            const int kk0 =
+                p * 64 + wave_m * 32 + mi * 16 + (lane >> 4) * 4;
+            alignas(8) bf16 pack[4];
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+              pack[r] = __float2bfloat16(state_reg[p][mi][ni][r]);
+            *reinterpret_cast<NativeB64*>(
+                state_bf16 + v_local * kKStride + kk0) =
+                *reinterpret_cast<const NativeB64*>(pack);
+          }
+    }
+    // Stage W in two halves only for C500 BV32; all other device images use
+    // the original full-panel path.
+    constexpr bool kHalfWPanel = HalfWPanel;
+    constexpr int kWPanelRows = kHalfWPanel ? kBT / 2 : kBT;
+#pragma unroll
+    for (int copy = 0; copy < kWPanelRows * kK / (Threads * 8); ++copy) {
+      const int vec = threadIdx.x + copy * Threads;
       const int t = vec >> 4;
       const int kblk = vec & 15;
       const int rowc = FullChunk ? t : (t < row_max ? t : row_max);
@@ -548,8 +592,8 @@ __device__ __forceinline__ void process_chunk_native(
     // would scatter 16 cache lines per warp instruction and measured 15.6%
     // slower on shape 1, independent of the total bytes written.
 #pragma unroll
-    for (int copy = 0; copy < Bv * 16 / kThreads; ++copy) {
-      const int vec = threadIdx.x + copy * kThreads;
+    for (int copy = 0; copy < Bv * 16 / Threads; ++copy) {
+      const int vec = threadIdx.x + copy * Threads;
       const int v_local = vec >> 4;
       const int kk = (vec & 15) * 8;
       // kKStride is 264 bytes, so this row is only 8-byte aligned: read the two
@@ -575,58 +619,89 @@ __device__ __forceinline__ void process_chunk_native(
       for (int ni = 0; ni < kNV; ++ni)
         projection[mi][ni] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+    // C500 BV32 uses two W phases; other device images compile one full phase.
+    // The barriers protect the shared panel while each reading wave finishes.
 #pragma unroll
-    for (int ki = 0; ki < 8; ++ki) {
-      NativeB64 af[2];
-      NativeB64 bf[2];
+    for (int w_phase = 0; w_phase < (kHalfWPanel ? 2 : 1); ++w_phase) {
+      if constexpr (kHalfWPanel) {
+        if (w_phase == 1) {
 #pragma unroll
-      for (int mi = 0; mi < 2; ++mi) {
-        const int row = wave_m * 32 + mi * 16 + (lane & 15);
-        af[mi] = load_contiguous_bf16x4(
-            w_panel + row * kKStride + ki * 16 + (lane >> 4) * 4);
+          for (int copy = 0; copy < kWPanelRows * kK / (Threads * 8);
+               ++copy) {
+            const int vec = threadIdx.x + copy * Threads;
+            const int t = (vec >> 4) + kWPanelRows;
+            const int kblk = vec & 15;
+            const int rowc = FullChunk ? t : (t < row_max ? t : row_max);
+            const uint4 word = *reinterpret_cast<const uint4*>(
+                w_c + rowc * tok_k + kblk * 8);
+            uint2 halves[2];
+            std::memcpy(halves, &word, sizeof(word));
+            *reinterpret_cast<uint2*>(
+                w_panel + (t - kWPanelRows) * kKStride + kblk * 8) = halves[0];
+            *reinterpret_cast<uint2*>(
+                w_panel + (t - kWPanelRows) * kKStride + kblk * 8 + 4) =
+                halves[1];
+          }
+          __syncthreads();
+        }
       }
+      if (!kHalfWPanel || wave_m == w_phase) {
 #pragma unroll
-      for (int ni = 0; ni < kNV; ++ni) {
-        const int row = (lane >> 4) * 4;
-        const int col = wave_n * (Bv / 2) + ni * 16 + (lane & 15);
-        bf[ni] = load_contiguous_bf16x4(
-            state_bf16 + col * kKStride + ki * 16 + row);
+        for (int ki = 0; ki < 8; ++ki) {
+          NativeB64 af[2];
+          NativeB64 bf[2];
+#pragma unroll
+          for (int mi = 0; mi < 2; ++mi) {
+            const int row = (kHalfWPanel ? 0 : wave_m * 32) + mi * 16 +
+                            (lane & 15);
+            af[mi] = load_contiguous_bf16x4(
+                w_panel + row * kKStride + ki * 16 + (lane >> 4) * 4);
+          }
+#pragma unroll
+          for (int ni = 0; ni < kNV; ++ni) {
+            const int row = (lane >> 4) * 4;
+            const int col = wave_n * (Bv / 2) + ni * 16 + (lane & 15);
+            bf[ni] = load_contiguous_bf16x4(
+                state_bf16 + col * kKStride + ki * 16 + row);
+          }
+#pragma unroll
+          for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+            for (int ni = 0; ni < kNV; ++ni)
+              projection[mi][ni] = __builtin_mxc_mma_16x16x16bf16(
+                  af[mi], bf[ni], projection[mi][ni]);
+        }
       }
-#pragma unroll
-      for (int mi = 0; mi < 2; ++mi)
-#pragma unroll
-        for (int ni = 0; ni < kNV; ++ni)
-          projection[mi][ni] = __builtin_mxc_mma_16x16x16bf16(
-              af[mi], bf[ni], projection[mi][ni]);
+      // Every wave must finish reading W and the state snapshot before either
+      // panel is reused. The final barrier also protects the following K copy.
+      __syncthreads();
     }
 
-    // Every wave must stop reading the snapshot before the async K copy
-    // overwrites the same panel. barrier_inst is wave-scoped.
-    __syncthreads();
-
-    // Snapshot is dead after projection. Refill the same panel with the K tile.
-    // The row stride is kKStride, not kK: the update A operand reads four kk at
-    // a stride of ldm, and ldm = 128 folds all four wave_m groups onto the same
-    // eight banks (measured 6.7% penalty); ldm = kKStride removes it. cp.async
-    // cannot be used here because it silently corrupts non-dense BF16
-    // destinations on this backend, so this is a plain 16-byte copy.
+    // Snapshot is dead after projection. BV16 refills the panel densely: this
+    // is the thread-major Hgemm B layout (time-major, eight adjacent K values
+    // per 16-byte vector). Its LDS/PERM reader handles bank distribution, so
+    // the fill no longer needs the padded 132-half row or split 8-byte stores.
+    // Other instantiations retain the measured padded layout.
 #pragma unroll
-    for (int copy = 0; copy < kBT * 16 / kThreads; ++copy) {
-      const int vec = threadIdx.x + copy * kThreads;
+    for (int copy = 0; copy < kBT * 16 / Threads; ++copy) {
+      const int vec = threadIdx.x + copy * Threads;
       const int t = vec >> 4;
       const int kblk = vec & 15;
-      const uint4 word =
-          *reinterpret_cast<const uint4*>(
-              k_c + (FullChunk ? t : (t < row_max ? t : row_max)) * tok_kk +
-                  kblk * 8);
-      // kKStride is 8-byte but not 16-byte aligned: store the 16 bytes as two
-      // 8-byte halves.
-      uint2 halves[2];
-      std::memcpy(halves, &word, sizeof(word));
-      *reinterpret_cast<uint2*>(state_bf16 + t * kKStride + kblk * 8) =
-          halves[0];
-      *reinterpret_cast<uint2*>(state_bf16 + t * kKStride + kblk * 8 + 4) =
-          halves[1];
+      const int rowc = FullChunk ? t : (t < row_max ? t : row_max);
+      const uint4 word = *reinterpret_cast<const uint4*>(
+          k_c + rowc * tok_kk + kblk * 8);
+      if constexpr (Bv == 16 && Threads == 128) {
+        *reinterpret_cast<uint4*>(state_bf16 + t * kK + kblk * 8) = word;
+      } else {
+        // kKStride is 8-byte but not 16-byte aligned: store the 16 bytes as
+        // two 8-byte halves.
+        uint2 halves[2];
+        std::memcpy(halves, &word, sizeof(word));
+        *reinterpret_cast<uint2*>(
+            state_bf16 + t * kKStride + kblk * 8) = halves[0];
+        *reinterpret_cast<uint2*>(
+            state_bf16 + t * kKStride + kblk * 8 + 4) = halves[1];
+      }
     }
 
     // Scalar-g applies a per-token relative decay to the residual used by the
@@ -707,68 +782,117 @@ __device__ __forceinline__ void process_chunk_native(
     }
     __syncthreads();
 
+    if constexpr (Bv == 16 && Threads == 128) {
+      // Hgemm B layout: each wave owns one contiguous 64-column K block. Four
+      // 64-bit loads fetch a 4(time) x 4(K) register tile; byte permutes turn
+      // its columns into the four BF16 MMA fragments without a shared-memory
+      // transpose.
+      // Keep the recurrent state in the native MMA C-fragment itself. Apply
+      // the per-K decay in place, then accumulate K^T @ residual directly into
+      // state_reg instead of keeping a second 16-float update tile live.
+      const int kk_base = wave_m * 64 + (lane >> 4) * 16;
 #pragma unroll
-    for (int k_phase = 0; k_phase < kK; k_phase += 64) {
-      NativeF32x4 update[2][kNV];
+      for (int i = 0; i < 4; ++i) {
+        const NativeF32x4 decay = *reinterpret_cast<const NativeF32x4*>(
+            decay_panel + kk_base + i * 4);
 #pragma unroll
-      for (int mi = 0; mi < 2; ++mi)
-#pragma unroll
-        for (int ni = 0; ni < kNV; ++ni)
-          update[mi][ni] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int q = 0; q < 4; ++q)
+          state_reg[q >> 1][q & 1][0][i] *= decay[q];
+      }
 
 #pragma unroll
       for (int t0 = 0; t0 < kBT; t0 += 16) {
-        NativeB64 af[2];
-        NativeB64 bf[2];
+        const int time_base = t0 + (lane >> 4) * 4;
+        const int kk_base = wave_m * 64 + (lane & 15) * 4;
+        NativeB64 raw[4];
 #pragma unroll
-        for (int mi = 0; mi < 2; ++mi) {
-          const int kk = k_phase + wave_m * 32 + mi * 16;
-          af[mi] = load_a_col_bf16x4(
-              state_bf16 + t0 * kKStride + kk, kKStride, lane);
+        for (int j = 0; j < 4; ++j) {
+          raw[j] = *reinterpret_cast<const NativeB64*>(
+              state_bf16 + (time_base + j) * kK + kk_base);
         }
+
+        NativeB64 k_frag[4];
+        k_frag[0][0] = perm_b32(raw[0][0], raw[1][0], kPermSel0);
+        k_frag[0][1] = perm_b32(raw[2][0], raw[3][0], kPermSel0);
+        k_frag[1][0] = perm_b32(raw[0][0], raw[1][0], kPermSel1);
+        k_frag[1][1] = perm_b32(raw[2][0], raw[3][0], kPermSel1);
+        k_frag[2][0] = perm_b32(raw[0][1], raw[1][1], kPermSel0);
+        k_frag[2][1] = perm_b32(raw[2][1], raw[3][1], kPermSel0);
+        k_frag[3][0] = perm_b32(raw[0][1], raw[1][1], kPermSel1);
+        k_frag[3][1] = perm_b32(raw[2][1], raw[3][1], kPermSel1);
+
+        const NativeB64 residual_frag =
+            *reinterpret_cast<const NativeB64*>(
+                residual_panel + (lane & 15) * kResStride + time_base);
 #pragma unroll
-        for (int ni = 0; ni < kNV; ++ni) {
-          const int col = wave_n * (Bv / 2) + ni * 16;
-          bf[ni] = *reinterpret_cast<const NativeB64*>(
-              residual_panel + (col + (lane & 15)) * kResStride + t0 +
-              (lane >> 4) * 4);
+        for (int q = 0; q < 4; ++q) {
+          state_reg[q >> 1][q & 1][0] = __builtin_mxc_mma_16x16x16bf16(
+              k_frag[q], residual_frag, state_reg[q >> 1][q & 1][0]);
         }
+      }
+
+      // The next chunk reuses state_bf16 for its snapshot and K tile.
+      __syncthreads();
+    } else {
+#pragma unroll
+      for (int k_phase = 0; k_phase < kK; k_phase += 64) {
+        NativeF32x4 update[2][kNV];
 #pragma unroll
         for (int mi = 0; mi < 2; ++mi)
 #pragma unroll
           for (int ni = 0; ni < kNV; ++ni)
-            update[mi][ni] = __builtin_mxc_mma_16x16x16bf16(
-                af[mi], bf[ni], update[mi][ni]);
-      }
+            update[mi][ni] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-      // The lane owns four consecutive kk, so the decay load is a single
-      // 16-byte access and the decay is computed once per (phase, mi).  The
-      // update MMA already produced the accumulator in the state_reg layout,
-      // so the whole read-modify-write is eight FMAs per thread.
-      const int p = k_phase >> 6;
 #pragma unroll
-      for (int mi = 0; mi < 2; ++mi) {
-        const int kk0 = k_phase + wave_m * 32 + mi * 16 + (lane >> 4) * 4;
-        const NativeF32x4 decay =
-            *reinterpret_cast<const NativeF32x4*>(decay_panel + kk0);
+        for (int t0 = 0; t0 < kBT; t0 += 16) {
+          NativeB64 af[2];
+          NativeB64 bf[2];
 #pragma unroll
-        for (int ni = 0; ni < kNV; ++ni) {
+          for (int mi = 0; mi < 2; ++mi) {
+            const int kk = k_phase + wave_m * 32 + mi * 16;
+            af[mi] = load_a_col_bf16x4(
+                state_bf16 + t0 * kKStride + kk, kKStride, lane);
+          }
 #pragma unroll
-          for (int r = 0; r < 4; ++r)
-            state_reg[p][mi][ni][r] =
-                fmaf(state_reg[p][mi][ni][r], decay[r], update[mi][ni][r]);
+          for (int ni = 0; ni < kNV; ++ni) {
+            const int col = wave_n * (Bv / 2) + ni * 16;
+            bf[ni] = *reinterpret_cast<const NativeB64*>(
+                residual_panel + (col + (lane & 15)) * kResStride + t0 +
+                (lane >> 4) * 4);
+          }
+#pragma unroll
+          for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+            for (int ni = 0; ni < kNV; ++ni)
+              update[mi][ni] = __builtin_mxc_mma_16x16x16bf16(
+                  af[mi], bf[ni], update[mi][ni]);
         }
+
+        const int p = k_phase >> 6;
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+          const int kk0 =
+              k_phase + wave_m * 32 + mi * 16 + (lane >> 4) * 4;
+          const NativeF32x4 decay =
+              *reinterpret_cast<const NativeF32x4*>(decay_panel + kk0);
+#pragma unroll
+          for (int ni = 0; ni < kNV; ++ni) {
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+              state_reg[p][mi][ni][r] =
+                  fmaf(state_reg[p][mi][ni][r], decay[r], update[mi][ni][r]);
+          }
+        }
+        __syncthreads();
       }
-      // Still required: the next chunk overwrites state_bf16, which this
-      // iteration is reading as the update A operand.
-      __syncthreads();
     }
 }
 
 template <bool Streaming, bool Pool = false, bool Gqa = false, bool Exp2 = false,
           bool UseG = false, bool Ragged = false, bool StateBf16 = false,
-          bool SaveNewValue = true, int Bv = 64, typename IndexT = int>
-__global__ __launch_bounds__(kThreads) void chunk_delta_native_kernel(
+          bool SaveNewValue = true, int Bv = 64, typename IndexT = int,
+          bool TailFreeRagged = false, int Threads = kThreads>
+__global__ __launch_bounds__(Threads) void chunk_delta_native_kernel(
     const bf16* __restrict__ k, const bf16* __restrict__ w,
     const bf16* __restrict__ u, const float* __restrict__ g,
     const float* __restrict__ gk, bool has_gk,
@@ -782,18 +906,28 @@ __global__ __launch_bounds__(kThreads) void chunk_delta_native_kernel(
     int use_exp2,                           // Triton USE_EXP2
     const int* __restrict__ cu_seqlens,     // Ragged only: N+1 sequence offsets
     const int* __restrict__ chunk_offsets) { // Ragged only: N global chunk offsets
-  // No FP32 state panel: the 64x128 state is register-resident.
-  // Per-warp v coverage is Bv/2 (two wave_n values) and each MMA n-tile is 16.
-  constexpr int kNV = Bv / 32;
+  // No FP32 state panel: the Bv x 128 state is register-resident.
+  // BV32/BV64 use two wave_n values. The exact-shape BV16 path launches two
+  // waves total: wave_m selects 32 projection rows, then one contiguous
+  // 64-column K block for the Hgemm/PERM recurrent update.
+  constexpr bool kBV16 = Bv == 16;
+  constexpr int kNV = kBV16 ? 1 : Bv / 32;
+  static_assert((kBV16 && Threads == 128) || (!kBV16 && Threads == kThreads),
+                "BV16 uses 128 threads; BV32/BV64 use 256 threads");
   // This buffer holds the BF16 snapshot (Bv rows, padded stride) and is then
   // reused for the K tile, which is kBT rows x kK halves regardless of Bv.
   // Sizing it by Bv alone overflows the K tile when Bv < kBT.
-  constexpr int kStateBf16Elems = Bv * kKStride > kBT * kKStride
-                                      ? Bv * kKStride
-                                      : kBT * kKStride;
-  __shared__ bf16 state_bf16[kStateBf16Elems];             // 16 KiB
-  __shared__ bf16 residual_panel[Bv * kResStride];      //  8 KiB
-  __shared__ bf16 w_panel[kBT * kKStride];             // 16.5 KiB
+  constexpr int kKTileElems = kBV16 ? kBT * kK : kBT * kKStride;
+  constexpr int kStateBf16Elems =
+      Bv * kKStride > kKTileElems ? Bv * kKStride : kKTileElems;
+  // Dense BV16 K rows and their 16-byte stores require an aligned base.
+  __shared__ __align__(16) bf16 state_bf16[kStateBf16Elems];
+  __shared__ bf16 residual_panel[Bv * kResStride];
+  // Only the C500 packed ragged BF16-state BV32 case uses half-W staging.
+  // H8 FP32-state cases retain the original full W panel.
+  constexpr bool kHalfWPanel =
+      Bv == 32 && kC500DeviceImage && Ragged && StateBf16;
+  __shared__ bf16 w_panel[(kHalfWPanel ? kBT / 2 : kBT) * kKStride];
   __shared__ float decay_panel[kK];                    // 512 B
 
   const int v_tile = static_cast<int>(blockIdx.x);
@@ -855,74 +989,117 @@ __global__ __launch_bounds__(kThreads) void chunk_delta_native_kernel(
 
   const int wave = threadIdx.x >> 6;
   const int lane = threadIdx.x & 63;
-  const int wave_m = wave >> 1;
-  const int wave_n = wave & 1;
+  const int wave_m = kBV16 ? wave : wave >> 1;
+  const int wave_n = kBV16 ? 0 : wave & 1;
 
-  // The whole 64x128 FP32 state lives in registers.  Each thread owns eight
-  // 4-float vectors whose (kk, v) map is exactly the epilogue map of the
-  // update MMA, so the state read-modify-write needs no shared memory at all.
+  // The whole Bv x 128 FP32 state lives in registers. BV16 uses the Hgemm
+  // C-fragment order consumed by its four permuted K operands; other variants
+  // retain the original contiguous four-K vector mapping.
   NativeF32x4 state_reg[2][2][kNV];
+  if constexpr (kBV16) {
+    const int v_local = lane & 15;
+    const int kk_base = wave_m * 64 + (lane >> 4) * 16;
 #pragma unroll
-  for (int p = 0; p < 2; ++p)
+    for (int i = 0; i < 4; ++i) {
+      const NativeF32x4 contiguous =
+          state_valid
+              ? load_state_vec<StateBf16>(
+                    st_in, (v_base + v_local) * kK + kk_base + i * 4)
+              : NativeF32x4{0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-    for (int mi = 0; mi < 2; ++mi)
+      for (int q = 0; q < 4; ++q)
+        state_reg[q >> 1][q & 1][0][i] = contiguous[q];
+    }
+  } else {
 #pragma unroll
-      for (int ni = 0; ni < kNV; ++ni) {
-        const int v_local = wave_n * (Bv / 2) + ni * 16 + (lane & 15);
-        const int kk0 = p * 64 + wave_m * 32 + mi * 16 + (lane >> 4) * 4;
-        state_reg[p][mi][ni] =
-            state_valid
-                ? load_state_vec<StateBf16>(st_in,
-                                            (v_base + v_local) * kK + kk0)
-                : NativeF32x4{0.0f, 0.0f, 0.0f, 0.0f};
-      }
+    for (int p = 0; p < 2; ++p)
+#pragma unroll
+      for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < kNV; ++ni) {
+          const int v_local =
+              wave_n * (Bv / 2) + ni * 16 + (lane & 15);
+          const int kk0 =
+              p * 64 + wave_m * 32 + mi * 16 + (lane >> 4) * 4;
+          state_reg[p][mi][ni] =
+              state_valid
+                  ? load_state_vec<StateBf16>(
+                        st_in, (v_base + v_local) * kK + kk0)
+                  : NativeF32x4{0.0f, 0.0f, 0.0f, 0.0f};
+        }
+  }
 
-  for (int chunk_local = 0; chunk_local < n_chunks; ++chunk_local) {
-    const int token0 = bos + chunk_local * kBT;
-    const int chunk = boh + chunk_local;
-    // Highest row of this chunk that is inside the sequence, and the row whose
-    // gate defines the decay: both are kBT-1 for a whole chunk, which is what
-    // the dense instantiation folds to. Note the min with kBT-1 - without it a
-    // whole chunk would take its decay from eos-1-token0, i.e. a row of a much
-    // later chunk.
-    const int row_max = Ragged ? std::min(kBT - 1, eos - 1 - token0) : kBT - 1;
-    // Specialize the body twice. A ragged sequence still consists almost
-    // entirely of whole chunks; making `FullChunk` a compile-time value keeps
-    // their hot path free of the per-fragment xmask branches and 64-bit address
-    // selection needed only by the final partial chunk.
-    if constexpr (Ragged) {
-      if (row_max == kBT - 1) {
-        process_chunk_native<true, Streaming, Exp2, UseG, SaveNewValue, Bv>(
-            k, w, u, g, gk, has_gk, h, v_new, heads, head, k_heads_eff,
-            k_head, token0, chunk, v_base, row_max, tok_kk, wave_m, wave_n,
-            lane, state_bf16, residual_panel, w_panel, decay_panel, state_reg);
-      } else {
-        process_chunk_native<false, Streaming, Exp2, UseG, SaveNewValue, Bv>(
-            k, w, u, g, gk, has_gk, h, v_new, heads, head, k_heads_eff,
-            k_head, token0, chunk, v_base, row_max, tok_kk, wave_m, wave_n,
-            lane, state_bf16, residual_panel, w_panel, decay_panel, state_reg);
-      }
-    } else {
-      process_chunk_native<true, Streaming, Exp2, UseG, SaveNewValue, Bv>(
+  if constexpr (Ragged && !TailFreeRagged) {
+    // Keep the hot path branch-free even when the sequence has a partial tail:
+    // run all complete chunks through the FullChunk specialization, then invoke
+    // the masked body at most once for the final 1..63 rows.
+    const int sequence_tokens = eos - bos;
+    const int full_chunks = sequence_tokens / kBT;
+    for (int chunk_local = 0; chunk_local < full_chunks; ++chunk_local) {
+      const int token0 = bos + chunk_local * kBT;
+      const int chunk = boh + chunk_local;
+      process_chunk_native<true, Streaming, Exp2, UseG, SaveNewValue, Bv,
+                           Threads, kHalfWPanel>(
+          k, w, u, g, gk, has_gk, h, v_new, heads, head, k_heads_eff, k_head,
+          token0, chunk, v_base, kBT - 1, tok_kk, wave_m, wave_n, lane,
+          state_bf16, residual_panel, w_panel, decay_panel, state_reg);
+    }
+    const int tail_rows = sequence_tokens - full_chunks * kBT;
+    if (tail_rows != 0) {
+      const int chunk_local = full_chunks;
+      const int token0 = bos + chunk_local * kBT;
+      const int chunk = boh + chunk_local;
+      const int row_max = tail_rows - 1;
+      process_chunk_native<false, Streaming, Exp2, UseG, SaveNewValue, Bv,
+                           Threads, kHalfWPanel>(
           k, w, u, g, gk, has_gk, h, v_new, heads, head, k_heads_eff, k_head,
           token0, chunk, v_base, row_max, tok_kk, wave_m, wave_n, lane,
           state_bf16, residual_panel, w_panel, decay_panel, state_reg);
     }
+  } else {
+    for (int chunk_local = 0; chunk_local < n_chunks; ++chunk_local) {
+      const int token0 = bos + chunk_local * kBT;
+      const int chunk = boh + chunk_local;
+      process_chunk_native<true, Streaming, Exp2, UseG, SaveNewValue, Bv,
+                           Threads, kHalfWPanel>(
+          k, w, u, g, gk, has_gk, h, v_new, heads, head, k_heads_eff, k_head,
+          token0, chunk, v_base, kBT - 1, tok_kk, wave_m, wave_n, lane,
+          state_bf16, residual_panel, w_panel, decay_panel, state_reg);
+    }
   }
 
+  if constexpr (kBV16) {
+    if (state_valid) {
+      const int v_local = lane & 15;
+      const int kk_base = wave_m * 64 + (lane >> 4) * 16;
 #pragma unroll
-  for (int p = 0; p < 2; ++p)
+      for (int i = 0; i < 4; ++i) {
+        NativeF32x4 contiguous;
 #pragma unroll
-    for (int mi = 0; mi < 2; ++mi)
-#pragma unroll
-      for (int ni = 0; ni < kNV; ++ni) {
-        const int v_local = wave_n * (Bv / 2) + ni * 16 + (lane & 15);
-        const int kk0 = p * 64 + wave_m * 32 + mi * 16 + (lane >> 4) * 4;
-        if (state_valid) {
-          store_state_vec<StateBf16>(st_out, (v_base + v_local) * kK + kk0,
-                                     state_reg[p][mi][ni]);
-        }
+        for (int q = 0; q < 4; ++q)
+          contiguous[q] = state_reg[q >> 1][q & 1][0][i];
+        store_state_vec<StateBf16>(
+            st_out, (v_base + v_local) * kK + kk_base + i * 4, contiguous);
       }
+    }
+  } else {
+#pragma unroll
+    for (int p = 0; p < 2; ++p)
+#pragma unroll
+      for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < kNV; ++ni) {
+          const int v_local =
+              wave_n * (Bv / 2) + ni * 16 + (lane & 15);
+          const int kk0 =
+              p * 64 + wave_m * 32 + mi * 16 + (lane >> 4) * 4;
+          if (state_valid) {
+            store_state_vec<StateBf16>(
+                st_out, (v_base + v_local) * kK + kk0,
+                state_reg[p][mi][ni]);
+          }
+        }
+  }
 }
 
 
@@ -1052,12 +1229,32 @@ void launch_native(const torch::Tensor& k, const torch::Tensor& w,
                    int chunks_per_sequence, const IndexT* state_indices,
                    long long state_stride, int k_heads, int use_exp2,
                    bool gqa, bool exp2, bool use_scalar_g,
-                   bool save_new_value,
+                   bool save_new_value, bool use_c500_perm_bv16,
+                   bool c500_bv16_tail_free,
                    cudaStream_t stream) {
-  const dim3 grid(kV / 64, sequences * heads);
   const bf16* kp = reinterpret_cast<const bf16*>(k.data_ptr());
   const bf16* wp = reinterpret_cast<const bf16*>(w.data_ptr());
   const bf16* up = reinterpret_cast<const bf16*>(u.data_ptr());
+  if (use_c500_perm_bv16) {
+    const dim3 grid(kV / 16, sequences * heads);
+    if (c500_bv16_tail_free) {
+      chunk_delta_native_kernel<false, true, false, true, false, true, false,
+                                true, 16, IndexT, true, 128>
+          <<<grid, 128, 0, stream>>>(
+              kp, wp, up, g_ptr, gk_ptr, has_gk, initial_state, h, v_new,
+              sequences, heads, chunks_per_sequence, state_indices,
+              state_stride, k_heads, use_exp2, cu_seqlens, chunk_offsets);
+    } else {
+      chunk_delta_native_kernel<false, true, false, true, false, true, false,
+                                true, 16, IndexT, false, 128>
+          <<<grid, 128, 0, stream>>>(
+              kp, wp, up, g_ptr, gk_ptr, has_gk, initial_state, h, v_new,
+              sequences, heads, chunks_per_sequence, state_indices,
+              state_stride, k_heads, use_exp2, cu_seqlens, chunk_offsets);
+    }
+    return;
+  }
+  const dim3 grid(kV / 64, sequences * heads);
 #define MCOPLIB_LAUNCH(NV, G, E, UG, R, S)                                     \
   chunk_delta_native_kernel<false, true, G, E, UG, R, S, NV, 64, IndexT>       \
       <<<grid, kThreads, 0, stream>>>(                                          \
@@ -1377,6 +1574,21 @@ void chunk_gated_delta_rule_fwd_h_native_out(
       (!has_gk || gk->scalar_type() == at::kFloat) &&
       (initial_state.scalar_type() == at::kFloat ||
        initial_state.scalar_type() == at::kBFloat16);
+  // Generalization experiment for the retained C500 BV16/Hgemm-PERM layout.
+  // The all-trace sweep showed consistent wins only for single-sequence H8,
+  // while N>=2 and H64 regressed. Keep the functional/dtype contract fixed
+  // and generalize the 128-thread mapping across T only for N1/H8. Whole-
+  // chunk lengths use the branch-free instantiation; partial lengths use the
+  // full-chunk loop plus one masked tail epilogue.
+  const bool use_c500_perm_bv16 =
+      optimized_dtype && ragged && sequences == 1 && heads == 8 &&
+      !state_bf16 &&
+      k_heads == heads && !gqa && !has_g && has_gk && use_exp2 &&
+      save_new_value &&
+      std::strstr(at::cuda::getDeviceProperties(k.get_device())->name,
+                  "C500") != nullptr;
+  const bool c500_bv16_tail_free =
+      use_c500_perm_bv16 && k.size(1) % kBT == 0;
   if (!optimized_dtype) {
     if (initial_state_indices.scalar_type() == at::kInt) {
       launch_generic<int32_t>(
@@ -1417,7 +1629,8 @@ void chunk_gated_delta_rule_fwd_h_native_out(
         static_cast<int>(sequences), heads,
         static_cast<int>(chunks_per_sequence),
         initial_state_indices.data_ptr<int32_t>(), state_stride, k_heads,
-        use_exp2 ? 1 : 0, gqa, use_exp2, has_g, save_new_value, stream);
+        use_exp2 ? 1 : 0, gqa, use_exp2, has_g, save_new_value,
+        use_c500_perm_bv16, c500_bv16_tail_free, stream);
   } else {
     launch_native<int64_t>(
         k, w, u, g_ptr, gk_ptr, has_gk, state_ptr,
@@ -1426,7 +1639,8 @@ void chunk_gated_delta_rule_fwd_h_native_out(
         static_cast<int>(sequences), heads,
         static_cast<int>(chunks_per_sequence),
         initial_state_indices.data_ptr<int64_t>(), state_stride, k_heads,
-        use_exp2 ? 1 : 0, gqa, use_exp2, has_g, save_new_value, stream);
+        use_exp2 ? 1 : 0, gqa, use_exp2, has_g, save_new_value,
+        use_c500_perm_bv16, c500_bv16_tail_free, stream);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -162,6 +162,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("fatrelu_and_mul(Tensor! out, Tensor input, float threshold) -> ()");
   ops.impl("fatrelu_and_mul", torch::kCUDA, &fatrelu_and_mul);
 
+  // Metax-added: int8 SWA insert (see ops.h for details).
+  ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_int8_insert("
+      "Tensor q_in, Tensor kv, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+      "int q_head_padded, float eps, int cache_block_size) -> Tensor");
+  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_int8_insert", torch::kCUDA,
+           &fused_deepseek_v4_qnorm_rope_kv_rope_int8_insert);
+
+  ops.def(
+      "fused_deepseek_v41_qnorm_rope_kv_rope_int8_insert("
+      "Tensor q_in, Tensor kv, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+      "int q_head_padded, float eps, int cache_block_size, bool apply_q_norm=True) -> Tensor");
+  ops.impl("fused_deepseek_v41_qnorm_rope_kv_rope_int8_insert", torch::kCUDA,
+           &fused_deepseek_v41_qnorm_rope_kv_rope_int8_insert);
+
   ops.def(
       "swigluoai_and_mul(Tensor! out, Tensor input, float alpha=1.702, float "
       "limit=7.0) "
@@ -173,10 +190,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "situ_and_mul(Tensor! out, Tensor input, float beta=1.0, float "
       "linear_beta=-1.0) -> ()");
   ops.impl("situ_and_mul", torch::kCUDA, &situ_and_mul);
+  // Fused SituGLU activation + dynamic FP8 quantization for the Humming w2 path
+  // (writes the fp8 down input and its float32 scale). group_size=0 ->
+  // per-token scale [.., 1]; group_size=128 -> k-major block-FP8 scale [..,
+  // d/128].
+  ops.def(
+      "situ_and_mul_quant(Tensor! out, Tensor! scale, Tensor input, "
+      "float beta=1.0, float linear_beta=-1.0, int group_size=0, "
+      "Tensor? num_valid_tokens=None, int topk=1) -> ()");
+  ops.impl("situ_and_mul_quant", torch::kCUDA, &situ_and_mul_quant);
   ops.def(
       "masked_situ_and_mul(Tensor! out, Tensor input, Tensor "
       "expert_num_tokens, float beta=1.0, float linear_beta=-1.0) -> ()");
   ops.impl("masked_situ_and_mul", torch::kCUDA, &masked_situ_and_mul);
+  ops.def(
+      "masked_moe_activation(Tensor! out, Tensor input, Tensor "
+      "valid_token_counts, str activation, float clamp_limit=0.0, float "
+      "alpha=1.0, float beta=0.0, float situ_beta=1.0, float "
+      "situ_linear_beta=-1.0) -> ()");
+  ops.impl("masked_moe_activation", torch::kCUDA, &masked_moe_activation);
 
   // GELU implementation used in GPT-2.
   ops.def("gelu_new(Tensor! out, Tensor input) -> ()");
@@ -212,8 +244,66 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                             Tensor kv_cache_ptrs,"
       "                             Tensor slot_mapping,"
       "                             int block_size, int block_stride,"
-      "                             int entry_stride) -> ()");
+      "                             int entry_stride,"
+      "                             Tensor? kv_scales=None,"
+      "                             str kv_cache_dtype='auto') -> ()");
   ops.impl("concat_and_cache_mla_grouped", torch::kCUDA, &concat_and_cache_mla_grouped);
+
+#ifndef USE_ROCM
+  ops.def(
+      "hisparse_resolve_residency(Tensor host_cache,"
+      "                 Tensor! hot_cache,"
+      "                 Tensor hot_block_table,"
+      "                 Tensor global_indices,"
+      "                 Tensor! hot_indices,"
+      "                 Tensor! device_global_indices,"
+      "                 Tensor! lru_slots,"
+      "                 Tensor? request_state_indices,"
+      "                 int region_stride,"
+      "                 Tensor(a!)? miss_mask=None,"
+      "                 Tensor(b!)? stats=None,"
+      "                 Tensor(c!)? attention_indices=None,"
+      "                 int attention_block_stride=0,"
+      "                 Tensor? request_ids=None,"
+      "                 Tensor? source_block_table=None,"
+      "                 int source_block_size=0,"
+      "                 Tensor(d!)? resolved_global_indices=None,"
+      "                 Tensor(e!)? valid_counts=None,"
+      "                 Tensor(f!)? swap_host_physical_rows=None,"
+      "                 Tensor(g!)? swap_device_physical_rows=None,"
+      "                 Tensor(h!)? swap_counts=None,"
+      "                 Tensor? resident_block_table=None,"
+      "                 int resident_block_size=0,"
+      "                 int resident_null_block=0) -> ()");
+  ops.impl("hisparse_resolve_residency", torch::kCUDA, &hisparse_resolve_residency);
+
+  ops.def(
+      "hisparse_invalidate_written_slots(Tensor! device_global_indices,"
+      "                                   Tensor request_state_indices,"
+      "                                   Tensor req_id_per_token,"
+      "                                   Tensor written_slots) -> ()");
+  ops.impl("hisparse_invalidate_written_slots", torch::kCUDA, &hisparse_invalidate_written_slots);
+
+  ops.def(
+      "hisparse_gather_plan(Tensor host_cache,"
+      "                     Tensor! hot_cache,"
+      "                     Tensor global_indices,"
+      "                     Tensor hot_indices,"
+      "                     Tensor miss_mask,"
+      "                     Tensor? request_state_indices,"
+      "                     Tensor(a!)? attention_indices=None,"
+      "                     int attention_block_stride=0) -> ()");
+  ops.impl("hisparse_gather_plan", torch::kCUDA, &hisparse_gather_plan);
+
+  ops.def(
+      "hisparse_gather_compact(Tensor host_cache,"
+      "                        Tensor! hot_cache,"
+      "                        Tensor miss_global_indices,"
+      "                        Tensor miss_hot_indices,"
+      "                        Tensor miss_counts) -> ()");
+  ops.impl("hisparse_gather_compact", torch::kCUDA, &hisparse_gather_compact);
+
+#endif  // !USE_ROCM
 
 //   // Function for fused QK Norm and RoPE
 //   ops.def(
@@ -241,24 +331,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "(Tensor, Tensor, Tensor)");
   ops.impl("step5_fused_qk_norm_rope", torch::kCUDA,
            &step5_fused_qk_norm_rope);
-  // Horizontally-fused DeepseekV4-MLA: per-head RMSNorm + GPT-J RoPE for Q, and
-  // GPT-J RoPE + UE8M0 FP8 quant + paged cache insert for KV, all in one
-  // kernel launch.
-  ops.def(
-      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
-      "Tensor q_in, Tensor kv, Tensor! k_cache, "
-      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
-      "int q_head_padded, float eps, int cache_block_size) -> Tensor");
-  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert", torch::kCUDA,
-           &fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert);
-
-  ops.def(
-      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out("
-      "Tensor q_in, Tensor kv, Tensor! q_out, Tensor! k_cache, "
-      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
-      "int q_head_padded, float eps, int cache_block_size) -> ()");
-  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out", torch::kCUDA,
-           &fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out);
 
   ops.def(
       "fused_deepseek_v4_qnorm_rope_kv_rope_insert("
@@ -268,21 +340,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_insert", torch::kCUDA,
            &fused_deepseek_v4_qnorm_rope_kv_rope_insert);
 
-  ops.def(
-      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert("
-      "Tensor q, Tensor kv, Tensor! q_fp8, Tensor! k_cache, "
-      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
-      "Tensor fp8_scale, Tensor q_fp8_scale_inv, float eps, "
-      "int cache_block_size) -> ()");
-  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert", torch::kCUDA, &fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert);
+//   ops.def(
+//       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert("
+//       "Tensor q, Tensor kv, Tensor! q_fp8, Tensor! k_cache, "
+//       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+//       "Tensor fp8_scale, Tensor q_fp8_scale_inv, float eps, "
+//       "int cache_block_size) -> ()");
+//   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert", torch::kCUDA, &fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert);
     
-  ops.def(
-      "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert("
-      "Tensor! q, Tensor kv, Tensor! k_cache, Tensor slot_mapping, "
-      "Tensor position_ids, Tensor cos_sin_cache, float eps, "
-      "int cache_block_size) -> ()");
-  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert", torch::kCUDA,
-        &fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert);
+//   ops.def(
+//       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert("
+//       "Tensor! q, Tensor kv, Tensor! k_cache, Tensor slot_mapping, "
+//       "Tensor position_ids, Tensor cos_sin_cache, float eps, "
+//       "int cache_block_size) -> ()");
+//   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert", torch::kCUDA,
+//         &fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert);
            
   // Apply repetition penalties to logits in-place
   ops.def(
@@ -303,6 +375,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor seq_lens, Tensor! indices, "
       "int numRows, int stride0, int stride1, int topK) -> ()");
   ops.impl("top_k_per_row_decode", torch::kCUDA, &top_k_per_row_decode);
+
+  ops.def(
+      "select_candidate_blocks(Tensor logits, Tensor? starts, Tensor ends, "
+      "int topk_blocks, int block_size, Tensor(a!) out, "
+      "int row_repeat=1) -> ()");
+  ops.impl("select_candidate_blocks", torch::kCUDA, &select_candidate_blocks);
+
+  ops.def(
+      "apply_candidate_mask(Tensor(a!) logits, Tensor? starts, Tensor ends, "
+      "Tensor candidates, int block_size, int row_repeat=1) -> ()");
+  ops.impl("apply_candidate_mask", torch::kCUDA, &apply_candidate_mask);
    
   ops.def(
       "persistent_topk(Tensor logits, Tensor lengths, Tensor! output, "
@@ -476,26 +559,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("dynamic_per_token_scaled_fp8_quant", torch::kCUDA,
            &dynamic_per_token_scaled_fp8_quant);
 
-  // Compute per-token-group FP8 quantized tensor and scaling factor.
-  // The trailing bool args are kept for vLLM call-site compatibility.
-  ops.def(
-      "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
-      "output_s, int group_size, float eps, float fp8_min, float fp8_max, "
-      "bool scale_ue8m0, bool dummy_is_scale_transposed, "
-      "bool dummy_is_tma_aligned) -> ()");
-
-  // Compute per-token-group 8-bit quantized tensor and UE8M0-packed,
-  // TMA-aligned scales for DeepGEMM.
-  ops.def(
-      "per_token_group_fp8_quant_packed(Tensor input, Tensor! output_q, "
-      "Tensor! output_s_packed, int group_size, float eps, float fp8_min, "
-      "float fp8_max) -> ()");
-  // Compute per-token-group INT8 quantized tensor and scaling factor.
-  ops.def(
-      "per_token_group_quant_int8(Tensor input, Tensor! output_q, Tensor! "
-      "output_s, int group_size, float eps, float int8_min, float int8_max) -> "
-      "()");
-
   ops.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
   ops.impl("permute_cols", torch::kCUDA, &permute_cols);
 
@@ -525,12 +588,27 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? cache_indices,"
       "Tensor? has_initial_state,"
       "Tensor! ssm_states,"
-      "int pad_slot_id) -> ()");
+      "int null_block_id,"
+      "int block_size,"
+      "Tensor? block_idx_first_scheduled_token,"
+      "Tensor? block_idx_last_scheduled_token,"
+      "Tensor? initial_state_idx,"
+      "Tensor? cu_chunk_seqlen,"
+      "Tensor? last_chunk_indices) -> ()");
   ops.impl("selective_scan_fwd", torch::kCUDA, &selective_scan_fwd);
 
   // LongCat n-gram embedding index kernel. All tensor args are marked mutable
   // to match the (non-const) stable-Tensor& C++ signature; only ne_token_table
   // and n_gram_ids are actually written in place.
+  // Fused vocab-parallel embedding: gather the rows this rank owns and write
+  // zeros for the rest, so the following all-reduce reconstructs the full
+  // embedding.
+  ops.def(
+      "vocab_parallel_embedding(Tensor! out, Tensor input_ids, Tensor weight, "
+      "int org_vocab_start_index, int org_vocab_end_index, "
+      "int num_org_vocab_padding, int added_vocab_start_index, "
+      "int added_vocab_end_index) -> ()");
+  ops.impl("vocab_parallel_embedding", torch::kCUDA, &vocab_parallel_embedding);
   ops.def(
       "ngram_compute_n_gram_ids(int ne_n, int ne_k, Tensor(a!) ne_weights, "
       "Tensor(b!) ne_mods, Tensor(c!) exclusive_ne_embedder_size_sums, "
@@ -577,6 +655,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? cos_sin_cache=None) -> ()");
   ops.impl("fused_kimi_k3_mla_key_concat_ds_mla_insert", torch::kCUDA, &fused_kimi_k3_mla_key_concat_ds_mla_insert);
   ops.def(
+      "fused_kimi_k3_mla_kv_concat(Tensor k_nope, Tensor k_pe, Tensor! k_out) "
+      "-> ()");
+  ops.impl("fused_kimi_k3_mla_kv_concat", torch::kCUDA, &fused_kimi_k3_mla_kv_concat);
+  ops.def(
+      "fused_kimi_k3_mla_kv_concat_quant_fp8("
+      "Tensor k_nope, Tensor k_pe, Tensor v, Tensor! k_fp8, Tensor! v_fp8) "
+      "-> ()");
+  ops.impl("fused_kimi_k3_mla_kv_concat_quant_fp8", torch::kCUDA, &fused_kimi_k3_mla_kv_concat_quant_fp8);
+  ops.def(
       "fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert("
       "Tensor q, Tensor k_nope, Tensor k_pe, Tensor kv_c_normed, Tensor v, "
       "Tensor! q_fp8, Tensor! k_fp8, Tensor! v_fp8, Tensor! k_cache, "
@@ -615,12 +702,24 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? norm_weight=None, float norm_eps=1e-5) -> ()");
   ops.impl("fused_kda_decode", torch::kCUDA, &fused_kda_decode);
 #endif
+#ifdef VLLM_ENABLE_FUSED_GDN_DECODE
+  ops.def(
+      "fused_gdn_decode_post_conv_mtp("
+      "Tensor mixed_qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, "
+      "Tensor state_indices, Tensor cu_seqlens, Tensor num_accepted_tokens, "
+      "Tensor! state, Tensor output_gate, Tensor norm_weight, Tensor! out, "
+      "float scale, float norm_eps=1e-5, "
+      "str output_gate_activation='silu') -> ()");
+  ops.impl("fused_gdn_decode_post_conv_mtp", torch::kCUDA, &fused_gdn_decode_post_conv_mtp);
+#endif
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES
   ops.def(
       "kimi_k3_attn_res("
-      "Tensor! prefix, Tensor delta, Tensor blocks, Tensor norm_weight, "
-      "Tensor qk_weight, Tensor output_norm_weight, Tensor! output, "
-      "int num_blocks, float eps, float output_norm_eps) -> ()");
+      "Tensor! prefix, Tensor? delta, Tensor! blocks, Tensor norm_weight, "
+      "Tensor qk_weight, Tensor? output_norm_weight, Tensor! output, "
+      "int num_blocks, "
+      "int block_write_idx, float eps, "
+      "float output_norm_eps) -> ()");
   ops.impl("kimi_k3_attn_res", torch::kCUDA, &kimi_k3_attn_res);
 #endif
 }
@@ -749,9 +848,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.def(
       "cp_gather_and_upconvert_fp8_kv_cache(Tensor src_cache, Tensor! dst, "
       "Tensor block_table, Tensor workspace_starts, int batch_size, Tensor? "
-      "seq_starts) -> ()");
+      "seq_starts, Tensor? host_cache=None, Tensor? host_row_ids=None, Tensor? "
+      "device_row_ids=None) -> ()");
   cache_ops.impl("cp_gather_and_upconvert_fp8_kv_cache", torch::kCUDA,
                  &cp_gather_and_upconvert_fp8_kv_cache);
+  
+  cache_ops.def(
+      "cp_gather_and_upconvert_nvfp4_kv_cache(Tensor src_cache, Tensor! dst, "
+      "Tensor block_table, Tensor workspace_starts, int batch_size) -> ()");
+  cache_ops.impl("cp_gather_and_upconvert_nvfp4_kv_cache", torch::kCUDA,
+                 &cp_gather_and_upconvert_nvfp4_kv_cache);
 
   cache_ops.def(
       "indexer_k_quant_and_cache(Tensor k, Tensor! kv_cache, Tensor "
@@ -801,6 +907,44 @@ REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
     //在 PyTorch 的 Schema 定义语言中（这与 Python 和 C++ 的函数传参规则完全一致）：一旦某个参数被赋予了默认值，那么它后面的所有参数都必须拥有默认值。不能出现“带默认值的参数”后面紧跟着“不带默认值的参数”
     ops.def(
+      "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
+      "output_s, "
+      "int group_size, float eps, float fp8_min, float fp8_max, bool "
+      "scale_ue8m0, bool dummy_is_scale_transposed, bool dummy_is_tma_aligned "
+      ") -> ()");
+    // Compute per-token-group 8-bit quantized tensor and UE8M0-packed,
+    // TMA-aligned scales for DeepGEMM.
+    ops.def(
+        "per_token_group_fp8_quant_packed(Tensor input, Tensor! output_q, "
+        "Tensor! output_s_packed, int group_size, float eps, float fp8_min, "
+        "float fp8_max) -> ()");
+      // Compute per-token-group INT8 quantized tensor and scaling factor.
+    ops.def(
+      "per_token_group_quant_int8(Tensor input, Tensor! output_q, Tensor! "
+      "output_s, int group_size, float eps, float int8_min, float int8_max) -> "
+      "()");
+    
+    ops.def(
+      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
+      "Tensor q_in, Tensor kv, Tensor! k_cache, "
+      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+      "int q_head_padded, float eps, int cache_block_size, "
+      "bool apply_q_norm=True, bool kv_mxfp8=False) -> Tensor");
+
+    // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.
+    ops.def(
+        "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert("
+        "Tensor! q, Tensor kv, Tensor! k_cache, Tensor slot_mapping, "
+        "Tensor position_ids, Tensor cos_sin_cache, float eps, "
+        "int cache_block_size, bool apply_q_norm=True) -> ()");
+    ops.def(
+        "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert("
+        "Tensor q, Tensor kv, Tensor! q_fp8, Tensor! k_cache, "
+        "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
+        "Tensor fp8_scale, Tensor q_fp8_scale_inv, float eps, "
+        "int cache_block_size, bool apply_q_norm=True) -> ()");
+        
+    ops.def(
       "fused_minimax_m3_qknorm_rope_kv_insert("
       "Tensor! qkv, Tensor q_norm_weight, Tensor k_norm_weight, "
       "Tensor cos_sin_cache, Tensor positions, int num_heads, "
@@ -815,13 +959,20 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
-    // torch::stable::Tensor kernels are not classic unboxed at::Tensor fns.
-    ops.impl("per_token_group_fp8_quant",
-             TORCH_BOX(&per_token_group_quant_fp8));
+      // Per-token group quantization
+    ops.impl("per_token_group_fp8_quant", TORCH_BOX(&per_token_group_quant_fp8));
     ops.impl("per_token_group_fp8_quant_packed",
-             TORCH_BOX(&per_token_group_quant_8bit_packed));
+            TORCH_BOX(&per_token_group_quant_8bit_packed));
     ops.impl("per_token_group_quant_int8",
-             TORCH_BOX(&per_token_group_quant_int8));
+           TORCH_BOX(&per_token_group_quant_int8));
+    ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+           TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
+    ops.impl(
+        "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
+        TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert));
+    ops.impl(
+        "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
+        TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert));
     ops.impl("fused_minimax_m3_qknorm_rope_kv_insert",
            TORCH_BOX(&fused_minimax_m3_qknorm_rope_kv_insert));
 }

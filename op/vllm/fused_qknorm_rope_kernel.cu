@@ -308,8 +308,6 @@ __global__ void fusedQKNormRopeKernel(
 #endif
 }
 
-// Borrowed from
-// https://github.com/flashinfer-ai/flashinfer/blob/8125d079a43e9a0ba463a4ed1b639cefd084cec9/include/flashinfer/pos_enc.cuh#L568
 #define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
   if (interleave) {                                      \
     const bool INTERLEAVE = true;                        \
@@ -318,6 +316,42 @@ __global__ void fusedQKNormRopeKernel(
     const bool INTERLEAVE = false;                       \
     __VA_ARGS__                                          \
   }
+
+namespace {
+// The empirical value for small batch: overlapping with the predecessor QKV
+// projection only pays off while this kernel is launch-bound.
+constexpr int kPDLEnableTokens = 16;
+
+// Launch helper for PDL (programmatic dependent launch), which lets this
+// kernel start while the predecessor QKV projection is still draining.  The
+// launch attribute is the only switch: with it off, the kernels'
+// cudaGridDependencySynchronize() / cudaTriggerProgrammaticLaunchCompletion()
+// are no-ops.
+template <typename KernelFn, typename... Args>
+void launchWithPDL(KernelFn kernel, dim3 gridDim, dim3 blockDim,
+                   size_t smem_bytes, cudaStream_t stream, bool enable_pdl,
+                   Args... args) {
+#ifndef USE_ROCM
+  cudaLaunchConfig_t config;
+  config.gridDim = gridDim;
+  config.blockDim = blockDim;
+  config.dynamicSmemBytes = smem_bytes;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  cudaLaunchKernelEx(&config, kernel, args...);
+#else
+  // ROCm: standard kernel launch syntax (no PDL/stream serialization).
+  (void)enable_pdl;
+  // clang-format off
+  kernel<<<gridDim, blockDim, smem_bytes, stream>>>(args...);
+  // clang-format on
+#endif
+}
+}  // namespace
 
 template <typename scalar_t_in, typename scalar_t_cache>
 void launchFusedQKNormRope(void* qkv, int const num_tokens,
@@ -336,30 +370,33 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens,
   int const gridSize = common::divUp(totalWarps, warpsPerBlock);
   dim3 gridDim(gridSize);
   dim3 blockDim(blockSize);
-
+  bool const enable_pdl = num_tokens <= kPDLEnableTokens;
   switch (head_dim) {
     case 64:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-        fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 64, INTERLEAVE>
-            <<<gridDim, blockDim, 0, stream>>>(
-                qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
-                k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
+        launchWithPDL(
+            fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 64, INTERLEAVE>,
+            gridDim, blockDim, 0, stream, enable_pdl, qkv, num_heads_q,
+            num_heads_k, num_heads_v, eps, q_weight, k_weight, cos_sin_cache,
+            position_ids, num_tokens, rotary_dim);
       });
       break;
     case 128:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-        fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 128, INTERLEAVE>
-            <<<gridDim, blockDim, 0, stream>>>(
-                qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
-                k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
+        launchWithPDL(
+            fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 128, INTERLEAVE>,
+            gridDim, blockDim, 0, stream, enable_pdl, qkv, num_heads_q,
+            num_heads_k, num_heads_v, eps, q_weight, k_weight, cos_sin_cache,
+            position_ids, num_tokens, rotary_dim);
       });
       break;
     case 256:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-        fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 256, INTERLEAVE>
-            <<<gridDim, blockDim, 0, stream>>>(
-                qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
-                k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
+        launchWithPDL(
+            fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 256, INTERLEAVE>,
+            gridDim, blockDim, 0, stream, enable_pdl, qkv, num_heads_q,
+            num_heads_k, num_heads_v, eps, q_weight, k_weight, cos_sin_cache,
+            position_ids, num_tokens, rotary_dim);
       });
       break;
     default:

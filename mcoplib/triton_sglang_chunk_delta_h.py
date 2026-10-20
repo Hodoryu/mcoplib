@@ -870,9 +870,10 @@ def _launch_chunk_gated_delta_rule_fwd_h(
         return
 
     if use_k128_fused:
-        # The long recurrent shape benefits from twice as many independent
-        # V tiles. Short single-chunk shapes stay on the BV64 kernel above.
-        k128_long_bv = 32
+        # C500 H8/T8192 has only 32 CTAs at BV32 for 104 APs. Use BV16
+        # on this exact shape to expose 64 independent V tiles/head programs;
+        # other devices and shapes keep the retained BV32 configuration.
+        k128_long_bv = 16 if _is_metax_c500(device_index) and T == 8192 else 32
         _chunk_gated_delta_rule_fwd_kernel_h_k128_fused[
             (triton.cdiv(V, k128_long_bv), N * H)
         ](

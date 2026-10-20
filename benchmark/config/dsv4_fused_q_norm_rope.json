@@ -1,5 +1,5 @@
 {
-    "batch_size": 16,
+    "batch_size": 8192,
     "num_heads": 8,
     "head_dim": 192,
     "rope_dim": 64,

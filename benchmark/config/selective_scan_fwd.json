@@ -1,11 +1,16 @@
 {
     "device_id": 0,
     "device_name": ["MetaX C500", "MetaX C600-UL", "Metax C600-U"],
-    "batch": 8,
-    "dim": 256,
-    "seqlen": 512,
-    "dstate": 16,
-    "n_groups": 1,
-    "dtype": "bfloat16",
+    "batch": 1,
+    "dim": 4,
+    "seqlen": [128, 1024, 4096],
+    "dstate": 8,
+    "n_groups": [1, 2],
+    "dtype": ["float32", "bfloat16"],
+    "has_D": [true, false],
+    "has_z": [true],
+    "has_delta_bias": [true],
+    "delta_softplus": [true],
+    "scan_chunks": [1, 3],
     "samples": 1000
 }

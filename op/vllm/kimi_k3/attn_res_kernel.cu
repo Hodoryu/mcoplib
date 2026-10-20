@@ -54,6 +54,7 @@ namespace sm80 {
 namespace fwd_prod_v2 {
 
 constexpr int K_TILE = 1024;
+constexpr int N_CHUNK_DEFAULT = 4;
 // No producer warp on SM80: all 256 threads cooperate on load + compute.
 constexpr int BLK = 256;
 constexpr int CONSUMER_THREADS = BLK;
@@ -118,15 +119,16 @@ __device__ __forceinline__ void cp_async_row(void* smem_dst,
   }
 }
 
-template <int H, int NC = NC_FIXED, bool RELEASE_TMEM = false,
-          bool HAS_DELTA = false, bool HAS_OUTPUT_NORM = false,
-          bool OUTPUT_NORM_IN_SMEM = false>
+template <int H, int N, int NC = N_CHUNK_DEFAULT, int B = 1,
+          bool RELEASE_TMEM = false, bool STATIC_COMMON_PATH = false,
+          bool HAS_OUTPUT_NORM = false>
 __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
-    const bf16_t* __restrict__ block_res, bf16_t* __restrict__ layer_res,
+    bf16_t* __restrict__ block_res, bf16_t* __restrict__ layer_res,
     const bf16_t* __restrict__ delta, const bf16_t* __restrict__ res_w,
-    const bf16_t* __restrict__ rms_w, bf16_t* __restrict__ output, int N, int T,
-    int B, int block_stride_m, int block_stride_r, float rms_eps,
-    const bf16_t* __restrict__ output_norm_weight, float output_norm_eps) {
+    const bf16_t* __restrict__ rms_w, bf16_t* __restrict__ output, int T,
+    int block_stride_m, int block_stride_r, float rms_eps,
+    const bf16_t* __restrict__ output_norm_weight, float output_norm_eps,
+    int block_write_idx) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   constexpr float LOG2_E = 1.4426950408889634f;
   constexpr int N_CHUNK = NC;
@@ -139,14 +141,16 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
   static_assert(H >= 4096 && H <= 8192);
   static_assert(H % K_TILE == 0);
   static_assert(CHUNK_DEPTH == 1);
-  static_assert(!OUTPUT_NORM_IN_SMEM, "SM80 path reads output_norm from gmem");
+  static_assert(!STATIC_COMMON_PATH || HAS_OUTPUT_NORM);
 
   const int tid = threadIdx.x;
   const int wid = tid >> 5;
   const int lane = tid & 31;
   const int TB = T * B;
   const int num_ctas = gridDim.x;
-  const int num_chunks = (N + N_CHUNK - 1) / N_CHUNK;
+  const bool has_delta = STATIC_COMMON_PATH || delta != nullptr;
+  const int write_idx = STATIC_COMMON_PATH ? -1 : block_write_idx;
+  constexpr int num_chunks = (N + N_CHUNK - 1) / N_CHUNK;
 
   const int group = (wid >= 4) ? 1 : 0;
   const int ct_in_group = tid & (CONSUMER_THREADS_PER_GROUP - 1);
@@ -154,7 +158,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
 
   constexpr size_t V_BYTES = (size_t)NUM_BUFS * H * sizeof(bf16_t);
   constexpr size_t DELTA_BYTES =
-      HAS_DELTA ? (size_t)CHUNK_DEPTH * H * sizeof(bf16_t) : 0;
+      (size_t)CHUNK_DEPTH * H * sizeof(bf16_t);
   extern __shared__ __align__(16) char smem_raw[];
   bf16_t* v_bufs = reinterpret_cast<bf16_t*>(smem_raw);  // [NUM_BUFS][H]
   bf16_t* delta_bufs = reinterpret_cast<bf16_t*>(smem_raw + V_BYTES);
@@ -177,11 +181,16 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
     if constexpr (H == 7168) {
       if (si == SLICES_PER_GROUP - 1) {
         int h_base = 6 * K_TILE + group * (K_TILE / 2) + ct_in_group * 4;
+        int2 rms_v = *reinterpret_cast<const int2*>(rms_w + h_base);
+        int2 res_v = *reinterpret_cast<const int2*>(res_w + h_base);
+        auto* rms2 = reinterpret_cast<__nv_bfloat162*>(&rms_v);
+        auto* res2 = reinterpret_cast<__nv_bfloat162*>(&res_v);
 #pragma unroll
-        for (int j = 0; j < 4; j++) {
-          int h = h_base + j;
-          q_cache[si * VEC + j] =
-              __bfloat162float(rms_w[h]) * __bfloat162float(res_w[h]);
+        for (int k = 0; k < 2; k++) {
+          float2 rf = __bfloat1622float2(rms2[k]);
+          float2 sf = __bfloat1622float2(res2[k]);
+          q_cache[si * VEC + 2 * k] = rf.x * sf.x;
+          q_cache[si * VEC + 2 * k + 1] = rf.y * sf.y;
         }
         continue;
       }
@@ -189,11 +198,16 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
     int dt = si * CONSUMER_GROUPS + group;
     if (dt >= NHT) continue;
     int h_base = dt * K_TILE + k_local;
+    int4 rms_v = *reinterpret_cast<const int4*>(rms_w + h_base);
+    int4 res_v = *reinterpret_cast<const int4*>(res_w + h_base);
+    auto* rms2 = reinterpret_cast<__nv_bfloat162*>(&rms_v);
+    auto* res2 = reinterpret_cast<__nv_bfloat162*>(&res_v);
 #pragma unroll
-    for (int j = 0; j < VEC; j++) {
-      int h = h_base + j;
-      q_cache[si * VEC + j] =
-          __bfloat162float(rms_w[h]) * __bfloat162float(res_w[h]);
+    for (int k = 0; k < 4; k++) {
+      float2 rf = __bfloat1622float2(rms2[k]);
+      float2 sf = __bfloat1622float2(res2[k]);
+      q_cache[si * VEC + 2 * k] = rf.x * sf.x;
+      q_cache[si * VEC + 2 * k + 1] = rf.y * sf.y;
     }
   }
 
@@ -209,17 +223,17 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
     for (int i = 0; i < ACC_PER_THREAD; i++) {
       acc32[i] = 0.f;
     }
-
+#pragma unroll
     for (int ci = 0; ci < num_chunks; ci++, gci++) {
       int ns = ci * N_CHUNK;
       int an = min(N_CHUNK, N - ns);
       int chunk_slot = (int)(gci % CHUNK_DEPTH);
 
       // ---- Load all `an` V rows (and delta if applicable) ----
+      int prefix_n = N - 1 - ns;
       bool load_delta = false;
-      int prefix_n = -1;
-      if constexpr (HAS_DELTA) {
-        prefix_n = N - 1 - ns;
+
+      if (has_delta) {
         if (prefix_n >= 0 && prefix_n < an) {
           load_delta = true;
         }
@@ -233,11 +247,11 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                           block_stride_r, H);
         cp_async_row(buf_ptr(slot), src, H * (int)sizeof(bf16_t));
       }
-      if constexpr (HAS_DELTA) {
-        if (load_delta) {
-          cp_async_row(delta_buf_ptr(chunk_slot), delta + (long long)tb * H,
-                       H * (int)sizeof(bf16_t));
-        }
+      if (has_delta && load_delta) {
+        cp_async_row(
+            delta_buf_ptr(chunk_slot),
+            delta + (long long)tb * H,
+            H * (int)sizeof(bf16_t));
       }
       // Plain vectorized loads/stores land in shared memory before the
       // __syncthreads() below; no cp.async commit/wait is needed on MACA.
@@ -265,10 +279,9 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                 int2 vp =
                     *reinterpret_cast<const int2*>(buf_ptr(slot) + h_base);
                 auto* v2 = reinterpret_cast<__nv_bfloat162*>(&vp);
-                if constexpr (HAS_DELTA) {
-                  if (n == prefix_n) {
-                    const bf16_t* delta_ptr =
-                        delta_buf_ptr(chunk_slot) + h_base;
+                if (n == prefix_n && (has_delta || write_idx >= 0)) {
+                  if (has_delta) {
+                    const bf16_t* delta_ptr = delta_buf_ptr(chunk_slot) + h_base;
 #pragma unroll
                     for (int j = 0; j < 2; j++) {
                       auto delta2 = *reinterpret_cast<const __nv_bfloat162*>(
@@ -282,6 +295,13 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                     *reinterpret_cast<int2*>(buf_ptr(slot) + h_base) = vp;
                     *reinterpret_cast<int2*>(layer_res + (long long)tb * H +
                                              h_base) = vp;
+                  }
+                  if (write_idx >= 0) {
+                    *reinterpret_cast<int2*>(
+                        block_res +
+                        (long long)(tb / B) * block_stride_m +
+                        (long long)write_idx * block_stride_r +
+                        h_base) = vp;
                   }
                 }
                 float2 f[2] = {__bfloat1622float2(v2[0]),
@@ -306,8 +326,8 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
             int slot = slot_of(gci, n);
             int4 vp = *reinterpret_cast<const int4*>(buf_ptr(slot) + h_base);
             auto* v2 = reinterpret_cast<__nv_bfloat162*>(&vp);
-            if constexpr (HAS_DELTA) {
-              if (n == prefix_n) {
+            if (n == prefix_n && (has_delta || write_idx >= 0)) {
+              if (has_delta) {
                 const bf16_t* delta_ptr = delta_buf_ptr(chunk_slot) + h_base;
 #pragma unroll
                 for (int j = 0; j < VEC / 2; j++) {
@@ -319,6 +339,13 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                 *reinterpret_cast<int4*>(buf_ptr(slot) + h_base) = vp;
                 *reinterpret_cast<int4*>(layer_res + (long long)tb * H +
                                          h_base) = vp;
+              }
+              if (write_idx >= 0) {
+                *reinterpret_cast<int4*>(
+                    block_res +
+                    (long long)(tb / B) * block_stride_m +
+                    (long long)write_idx * block_stride_r +
+                    h_base) = vp;
               }
             }
             float2 f[4] = {
@@ -639,27 +666,26 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
 #endif
 }
 
-template <int H, int NC = NC_FIXED, bool RELEASE_TMEM = false,
-          bool HAS_DELTA = false, bool HAS_OUTPUT_NORM = false,
-          bool OUTPUT_NORM_IN_SMEM = false>
-static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
+template <int H, int N, int NC = N_CHUNK_DEFAULT, bool RELEASE_TMEM = false,
+          bool STATIC_COMMON_PATH = false, bool HAS_OUTPUT_NORM = false>
+static void launch_fwd(bf16_t* block_residual, bf16_t* layer_residual,
                        const bf16_t* delta, const bf16_t* res_weight,
-                       const bf16_t* rms_weight, bf16_t* output, int N, int T,
-                       int B, float rms_eps, int num_sm, cudaStream_t stream,
+                       const bf16_t* rms_weight, bf16_t* output, int T,
+                       float rms_eps, int num_sm, cudaStream_t stream,
                        const bf16_t* output_norm_weight = nullptr,
                        float output_norm_eps = 0.f, int block_stride_m = 0,
-                       int block_stride_r = 0) {
+                       int block_stride_r = 0, int block_write_idx = -1) {
   // SM80 shared-memory budget: NUM_BUFS * H * 2 + (HAS_DELTA ? H * 2 : 0) +
   // sizeof(FwdSmemPlan<NC>). With H=7168, NC=2, CHUNK_DEPTH=1 this is
   // 2*14336 + 14336 + ~256 = ~43 KB, well within C500's 64 KB / SM.
   constexpr size_t smem_size =
-      ((size_t)CHUNK_DEPTH * (NC + (HAS_DELTA ? 1 : 0)) * H * sizeof(bf16_t) +
+      ((size_t)(CHUNK_DEPTH * (NC + 1) + (HAS_OUTPUT_NORM ? 1 : 0)) * H *
+           sizeof(bf16_t) +
        sizeof(FwdSmemPlan<NC>) + 15) &
       ~size_t(15);
-
   auto kernel =
-      &attn_res_fwd_online_v2_kernel<H, NC, RELEASE_TMEM, HAS_DELTA,
-                                     HAS_OUTPUT_NORM, OUTPUT_NORM_IN_SMEM>;
+      &attn_res_fwd_online_v2_kernel<H, N, NC, 1, RELEASE_TMEM,
+                                     STATIC_COMMON_PATH, HAS_OUTPUT_NORM>;
 
   static bool attrs_set = false;
   if (!attrs_set) {
@@ -676,64 +702,161 @@ static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
 
   kernel<<<grid, BLK, smem_size, stream>>>(
       block_residual, layer_residual, delta, res_weight, rms_weight, output,
-      N, T, B, block_stride_m, block_stride_r, rms_eps, output_norm_weight,
-      output_norm_eps);
+      T, block_stride_m, block_stride_r, rms_eps, output_norm_weight,
+      output_norm_eps, block_write_idx);
 }
 
 }  // namespace fwd_prod_v2
 }  // namespace sm80
 
 void kimi_k3_attn_res(torch::Tensor& prefix,
-                      torch::Tensor const& delta,
-                      torch::Tensor const& blocks,
+                      std::optional<torch::Tensor> delta,
+                      torch::Tensor& blocks,
                       torch::Tensor const& norm_weight,
                       torch::Tensor const& qk_weight,
-                      torch::Tensor const& output_norm_weight,
+                      std::optional<torch::Tensor> output_norm_weight,
                       torch::Tensor& output, int64_t num_blocks,
-                      double eps, double output_norm_eps) {
+                      int64_t block_write_idx, double eps,
+                      double output_norm_eps) {
   int const num_tokens = static_cast<int>(prefix.size(0));
   int const device = prefix.get_device();
   auto stream = at::cuda::getCurrentCUDAStream(device);
   cudaDeviceProp const* properties = at::cuda::getCurrentDeviceProperties();
 
+  int64_t const hidden_size = prefix.size(1);
+  int64_t const delta_stride = delta.has_value() && delta->numel() > 0 ? delta->stride(0) : 0;
+
+  TORCH_CHECK(prefix.stride(0) == hidden_size && output.stride(0) == hidden_size, 
+    "Kimi K3 AttnRes requires densely packed prefix/output rows; got strides ", prefix.stride(0), ", ", 
+    output.stride(0), " for hidden_size ", hidden_size);
+
+  if (delta.has_value() && delta->numel() > 0) {
+      TORCH_CHECK(delta->stride(0) == hidden_size, "Kimi K3 AttnRes requires densely packed delta rows; got stride ", 
+      delta->stride(0), " for hidden_size ", hidden_size);
+  }
+  TORCH_CHECK(
+      block_write_idx >= -1 && block_write_idx < blocks.size(1),
+      "Kimi K3 AttnRes: block_write_idx must be -1 or a valid "
+      "block row, got ",
+      block_write_idx);
+
   using namespace sm80::fwd_prod_v2;
   // HAS_DELTA / HAS_OUTPUT_NORM are selected at runtime based on whether the
   // caller actually supplied those tensors. This keeps the kernel from
   // dereferencing an empty delta tensor (an ATU fault on Metax C500).
-  bool const has_delta = delta.numel() > 0;
-  bool const has_output_norm = output_norm_weight.numel() > 0;
+  bool const has_delta = delta.has_value() && delta->numel() > 0;
+  bool const has_output_norm = output_norm_weight.has_value() && output_norm_weight->numel() > 0;
   // On Metax C500 (sm_80) we always use NC=2, CHUNK_DEPTH=1,
   // OUTPUT_NORM_IN_SMEM=false to keep the shared memory footprint within
   // 64 KB.
-  auto const bf_blocks = static_cast<bf16_t const*>(blocks.data_ptr());
+  auto const bf_blocks = static_cast<bf16_t*>(blocks.data_ptr());
   auto const bf_prefix_w = static_cast<bf16_t*>(prefix.data_ptr());
   auto const bf_delta =
-      static_cast<bf16_t const*>(has_delta ? delta.data_ptr() : nullptr);
+      static_cast<bf16_t const*>(has_delta ? delta->data_ptr() : nullptr);
   auto const bf_qk_w = static_cast<bf16_t const*>(qk_weight.data_ptr());
   auto const bf_norm_w = static_cast<bf16_t const*>(norm_weight.data_ptr());
   auto const bf_out_w = static_cast<bf16_t*>(output.data_ptr());
   auto const bf_outnorm_w = static_cast<bf16_t const*>(
-      has_output_norm ? output_norm_weight.data_ptr() : nullptr);
+      has_output_norm ? output_norm_weight->data_ptr() : nullptr);
   int const N = static_cast<int>(num_blocks) + 1;
   int const num_sm = properties->multiProcessorCount;
   cudaStream_t const stream2 = at::cuda::getCurrentCUDAStream(device);
   int const bsm = static_cast<int>(blocks.stride(0));
   int const bsr = static_cast<int>(blocks.stride(1));
 
-#define LAUNCH(HAS_D, HAS_ON)                                               \
-  launch_fwd<7168, NC_FIXED, false, HAS_D, HAS_ON, false>(                  \
-      bf_blocks, bf_prefix_w, bf_delta, bf_qk_w, bf_norm_w, bf_out_w, N,    \
-      num_tokens, 1, static_cast<float>(eps), num_sm, stream2, bf_outnorm_w,\
-      static_cast<float>(output_norm_eps), bsm, bsr)
+#define LAUNCH(N_VALUE, STATIC_PATH, HAS_ON)                             \
+  launch_fwd<7168, N_VALUE, NC_FIXED, false, STATIC_PATH, HAS_ON>(      \
+      bf_blocks, bf_prefix_w, bf_delta, bf_qk_w, bf_norm_w, bf_out_w,   \
+      num_tokens, static_cast<float>(eps), num_sm, stream2,             \
+      bf_outnorm_w, static_cast<float>(output_norm_eps), bsm, bsr,      \
+      static_cast<int>(block_write_idx))
 
-  if (has_delta && has_output_norm) {
-    LAUNCH(true, true);
-  } else if (has_delta && !has_output_norm) {
-    LAUNCH(true, false);
-  } else if (!has_delta && has_output_norm) {
-    LAUNCH(false, true);
-  } else {
-    LAUNCH(false, false);
+  switch (num_blocks) {
+    case 1:
+      if (has_delta && has_output_norm && block_write_idx < 0) {
+        LAUNCH(2, true, true);
+      } else if (has_output_norm) {
+        LAUNCH(2, false, true);
+      } else {
+        LAUNCH(2, false, false);
+      }
+      break;
+
+    case 2:
+      if (has_delta && has_output_norm && block_write_idx < 0) {
+        LAUNCH(3, true, true);
+      } else if (has_output_norm) {
+        LAUNCH(3, false, true);
+      } else {
+        LAUNCH(3, false, false);
+      }
+      break;
+
+    case 3:
+      if (has_delta && has_output_norm && block_write_idx < 0) {
+        LAUNCH(4, true, true);
+      } else if (has_output_norm) {
+        LAUNCH(4, false, true);
+      } else {
+        LAUNCH(4, false, false);
+      }
+      break;
+
+    case 4:
+      if (has_delta && has_output_norm && block_write_idx < 0) {
+        LAUNCH(5, true, true);
+      } else if (has_output_norm) {
+        LAUNCH(5, false, true);
+      } else {
+        LAUNCH(5, false, false);
+      }
+      break;
+
+    case 5:
+      if (has_delta && has_output_norm && block_write_idx < 0) {
+        LAUNCH(6, true, true);
+      } else if (has_output_norm) {
+        LAUNCH(6, false, true);
+      } else {
+        LAUNCH(6, false, false);
+      }
+      break;
+
+    case 6:
+      if (has_delta && has_output_norm && block_write_idx < 0) {
+        LAUNCH(7, true, true);
+      } else if (has_output_norm) {
+        LAUNCH(7, false, true);
+      } else {
+        LAUNCH(7, false, false);
+      }
+      break;
+
+    case 7:
+      if (has_delta && has_output_norm && block_write_idx < 0) {
+        LAUNCH(8, true, true);
+      } else if (has_output_norm) {
+        LAUNCH(8, false, true);
+      } else {
+        LAUNCH(8, false, false);
+      }
+      break;
+
+    case 8:
+      if (has_delta && has_output_norm && block_write_idx < 0) {
+        LAUNCH(9, true, true);
+      } else if (has_output_norm) {
+        LAUNCH(9, false, true);
+      } else {
+        LAUNCH(9, false, false);
+      }
+      break;
+
+    default:
+      TORCH_CHECK(
+          false,
+          "Kimi K3 AttnRes: num_blocks must be 1..8, got ",
+          num_blocks);
   }
 #undef LAUNCH
   cudaError_t const error = cudaGetLastError();
