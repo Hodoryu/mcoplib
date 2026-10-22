@@ -150,6 +150,8 @@ export BUILD_VLLM_SUBMODULE=OFF  BUILD_SGLANG_SUBMODULE=OFF BUILD_LMDEPLOY_SUBMO
 ## 算子说明书
 [算子说明书](./docs/mcoplib算子说明书.md)
 
+[算子说明书网页版](./docs/mcoplib Operator Manual (Web Version)/index.html)
+
 ## mcoplib 分支及对应的vllm && sglang 版本
 | 版本 | vLLM | SGLang | 备注 |
 |---|---|---|---|
